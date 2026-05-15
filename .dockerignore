@@ -1,0 +1,11 @@
+.git/
+.DS_Store
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Private/local map data and generated outputs.
+map/
+out/
+reference/
+trips.trips.xml
