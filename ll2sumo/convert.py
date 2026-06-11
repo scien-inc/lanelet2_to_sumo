@@ -2038,6 +2038,30 @@ def _run_netconvert(
         raise RuntimeError(f"netconvert failed with exit code {result.returncode}:\n{result.stderr}")
     return result
 
+def _run_netconvert_connection_patch(
+    net_path: Path,
+    connections_path: Path,
+    output_path: Path,
+    binary: str,
+) -> subprocess.CompletedProcess[str]:
+    command = [
+        binary,
+        "--sumo-net-file",
+        str(net_path),
+        "--connection-files",
+        str(connections_path),
+        "--precision",
+        "3",
+        "--precision.geo",
+        "8",
+        "--output-file",
+        str(output_path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"netconvert connection patch failed with exit code {result.returncode}:\n{result.stderr}")
+    return result
+
 
 def convert_map(
     input_path: str | Path,
@@ -2143,6 +2167,8 @@ def convert_map(
     edges_path = out_dir / "network.edg.xml"
     connections_path = out_dir / "network.con.xml"
     net_path = out_dir / "network.net.xml"
+    joined_connection_delete_path = out_dir / "network.joined-delete.con.xml"
+    patched_net_path = out_dir / "network.joined-filtered.net.xml"
     sidecar_path = out_dir / "retention.sidecar.json"
     report_path = out_dir / "conversion.report.json"
 
@@ -2219,6 +2245,8 @@ def convert_map(
     netconvert_result: subprocess.CompletedProcess[str] | None = None
     lane_length_patch_summary: dict[str, object] | None = None
     tls_phase_patch_summary: dict[str, object] | None = None
+    joined_unmapped_connection_cleanup_summary: dict[str, object] | None = None
+    joined_connection_patch_result: subprocess.CompletedProcess[str] | None = None
     internal_connection_shape_sync_summary: dict[str, object] | None = None
     internal_connection_shape_align_summary: dict[str, object] | None = None
     internal_shape_audit_summary: dict[str, object] | None = None
@@ -2234,6 +2262,28 @@ def convert_map(
             netconvert_binary,
             build_tls_from_nodes=build_tls_from_nodes,
         )
+        joined_unmapped_connection_cleanup_summary = net_postprocess._write_joined_unmapped_connection_deletions(
+            net_path,
+            connections_path,
+            joined_connection_delete_path,
+        )
+        if int(joined_unmapped_connection_cleanup_summary["deleted_joined_unmapped_connection_count"]) > 0:
+            joined_connection_patch_result = _run_netconvert_connection_patch(
+                net_path,
+                joined_connection_delete_path,
+                patched_net_path,
+                netconvert_binary,
+            )
+            patched_net_path.replace(net_path)
+            joined_unmapped_connection_after_summary = net_postprocess._summarize_joined_unmapped_connections(
+                net_path,
+                connections_path,
+            )
+            joined_unmapped_connection_cleanup_summary["joined_unmapped_connection_count_after"] = (
+                joined_unmapped_connection_after_summary["joined_unmapped_connection_count"]
+            )
+        else:
+            joined_unmapped_connection_cleanup_summary["joined_unmapped_connection_count_after"] = 0
         if build_tls_from_nodes:
             signal_summary.update(net_postprocess._summarize_net_tls(net_path))
             joined_intersection_area_tls_ids = (
@@ -2370,6 +2420,14 @@ def convert_map(
             "stdout": netconvert_result.stdout.strip(),
             "stderr": netconvert_result.stderr.strip(),
         }
+    if joined_connection_patch_result is not None:
+        report["netconvert_joined_connection_patch"] = {
+            "binary": netconvert_binary,
+            "stdout": joined_connection_patch_result.stdout.strip(),
+            "stderr": joined_connection_patch_result.stderr.strip(),
+        }
+    if joined_unmapped_connection_cleanup_summary is not None:
+        report["joined_unmapped_connection_cleanup"] = joined_unmapped_connection_cleanup_summary
     if lane_length_patch_summary is not None:
         report["lane_length_shape_patch"] = lane_length_patch_summary
     if internal_connection_shape_sync_summary is not None:

@@ -14,6 +14,7 @@ from ll2sumo.convert import (
     _lanelet_path_signal_stop_offset_m,
     _plan_vehicle_signals,
     _run_netconvert,
+    _run_netconvert_connection_patch,
     _signalized_intersection_area_ids,
     _write_nodes_xml,
 )
@@ -324,6 +325,27 @@ class NetconvertTlsBuildingTest(unittest.TestCase):
         self.assertIn("--tls.default-type", command)
         self.assertNotIn("--tls.guess-signals", command)
         self.assertNotIn("--tllogic-files", command)
+
+    def test_connection_patch_uses_existing_net_and_delete_connections(self) -> None:
+        with patch("ll2sumo.convert.subprocess.run") as run:
+            run.return_value = CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+            _run_netconvert_connection_patch(
+                Path("network.net.xml"),
+                Path("network.joined-delete.con.xml"),
+                Path("network.filtered.net.xml"),
+                "netconvert",
+            )
+
+        command = run.call_args.args[0]
+        self.assertIn("--sumo-net-file", command)
+        self.assertIn("network.net.xml", command)
+        self.assertIn("--connection-files", command)
+        self.assertIn("network.joined-delete.con.xml", command)
+        self.assertIn("--output-file", command)
+        self.assertIn("network.filtered.net.xml", command)
+        self.assertNotIn("--node-files", command)
+        self.assertNotIn("--edge-files", command)
 
 
 if __name__ == "__main__":
