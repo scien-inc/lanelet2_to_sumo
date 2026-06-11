@@ -706,18 +706,36 @@ def _japanese_tls_phases(link_infos: list[TLSLinkInfo], state_length: int) -> li
 
     return phases or None
 
-def _patch_net_japanese_tls_phases(net_path: str | Path) -> dict[str, object]:
+def _joined_intersection_area_tls_ids(net_path: str | Path) -> set[str]:
+    root = ET.parse(net_path).getroot()
+    tls_ids: set[str] = set()
+    for connection_element in root.findall("connection"):
+        tl_id = connection_element.attrib.get("tl")
+        via_lane_id = connection_element.attrib.get("via", "")
+        if tl_id and via_lane_id.startswith(":ia_"):
+            tls_ids.add(tl_id)
+    return tls_ids
+
+def _patch_net_japanese_tls_phases(
+    net_path: str | Path,
+    excluded_tls_ids: set[str] | None = None,
+) -> dict[str, object]:
     path = Path(net_path)
     tree = ET.parse(path)
     root = tree.getroot()
     link_infos_by_tls = _tls_link_infos(root)
+    excluded_tls_ids = excluded_tls_ids or set()
     patched_tls_ids: list[str] = []
+    skipped_excluded_tls_ids: list[str] = []
     skipped_single_axis_tls_ids: list[str] = []
     max_phase_count = 0
 
     for tl_logic_element in root.findall("tlLogic"):
         tl_id = tl_logic_element.attrib.get("id")
         if tl_id is None:
+            continue
+        if tl_id in excluded_tls_ids:
+            skipped_excluded_tls_ids.append(tl_id)
             continue
         link_infos = link_infos_by_tls.get(tl_id, [])
         if not link_infos:
@@ -752,6 +770,8 @@ def _patch_net_japanese_tls_phases(net_path: str | Path) -> dict[str, object]:
     return {
         "patched_tls_count": len(patched_tls_ids),
         "patched_tls_ids": patched_tls_ids,
+        "skipped_excluded_tls_count": len(skipped_excluded_tls_ids),
+        "skipped_excluded_tls_ids": skipped_excluded_tls_ids,
         "skipped_single_axis_tls_count": len(skipped_single_axis_tls_ids),
         "max_phase_count": max_phase_count,
     }

@@ -87,6 +87,15 @@ class ConnectionShape:
     source: str
 
 
+@dataclass(frozen=True)
+class IntersectionAreaNodeJoin:
+    intersection_area_id: str
+    join_id: str
+    node_ids: tuple[str, ...]
+    point: Point3D
+    shape: tuple[Point3D, ...]
+
+
 class DisjointSet:
     def __init__(self) -> None:
         self.parent: dict[str, str] = {}
@@ -994,6 +1003,86 @@ def _cluster_centroid(lanelet_ids: list[str], road_lanelets: dict[str, Lanelet])
     return _point_average(points)
 
 
+def _shape_xy_string(points: tuple[Point3D, ...]) -> str:
+    return " ".join(f"{point.x:.3f},{point.y:.3f}" for point in points)
+
+
+def _intersection_area_shape(lanelet_map: LaneletMap, intersection_area_id: str) -> tuple[Point3D, ...]:
+    area_way = lanelet_map.ways.get(intersection_area_id)
+    if area_way is None or area_way.tags.get("type") != "intersection_area":
+        return tuple()
+    points = tuple(lanelet_map.nodes[node_id] for node_id in area_way.node_ids if node_id in lanelet_map.nodes)
+    if len(points) < 3:
+        return tuple()
+    return points
+
+
+def _build_intersection_area_node_joins(
+    lane_groups: list[LaneGroup],
+    road_lanelets: dict[str, Lanelet],
+    lanelet_map: LaneletMap,
+    node_ids: dict[str, str],
+    node_points: dict[str, Point3D],
+    signalized_intersection_area_ids: set[str],
+) -> tuple[list[IntersectionAreaNodeJoin], dict[str, object]]:
+    node_ids_by_area: dict[str, set[str]] = defaultdict(set)
+    mixed_group_count = 0
+
+    for group in lane_groups:
+        group_area_ids = {
+            _intersection_area_id(road_lanelets[lanelet_id])
+            for lanelet_path in group.lanelet_paths
+            for lanelet_id in lanelet_path
+        }
+        if len(group_area_ids) != 1 or None in group_area_ids:
+            if any(area_id in signalized_intersection_area_ids for area_id in group_area_ids if area_id is not None):
+                mixed_group_count += 1
+            continue
+        intersection_area_id = next(iter(group_area_ids))
+        if intersection_area_id not in signalized_intersection_area_ids:
+            continue
+        start_node_id = node_ids.get(f"{group.group_id}:start")
+        end_node_id = node_ids.get(f"{group.group_id}:end")
+        if start_node_id is not None:
+            node_ids_by_area[intersection_area_id].add(start_node_id)
+        if end_node_id is not None:
+            node_ids_by_area[intersection_area_id].add(end_node_id)
+
+    joins: list[IntersectionAreaNodeJoin] = []
+    skipped_missing_shape_area_ids: list[str] = []
+    skipped_too_few_node_area_ids: list[str] = []
+    for intersection_area_id, area_node_ids in sorted(node_ids_by_area.items(), key=lambda item: _sort_key(item[0])):
+        if len(area_node_ids) < 2:
+            skipped_too_few_node_area_ids.append(intersection_area_id)
+            continue
+        shape = _intersection_area_shape(lanelet_map, intersection_area_id)
+        if not shape:
+            skipped_missing_shape_area_ids.append(intersection_area_id)
+            continue
+        ordered_node_ids = tuple(sorted(area_node_ids, key=_sort_key))
+        point = _point_average([node_points[node_id] for node_id in ordered_node_ids if node_id in node_points])
+        joins.append(
+            IntersectionAreaNodeJoin(
+                intersection_area_id=intersection_area_id,
+                join_id=f"ia_{intersection_area_id}",
+                node_ids=ordered_node_ids,
+                point=point,
+                shape=shape,
+            )
+        )
+
+    summary = {
+        "join_count": len(joins),
+        "joined_intersection_area_ids": [join.intersection_area_id for join in joins],
+        "mixed_signalized_group_count": mixed_group_count,
+        "skipped_missing_shape_count": len(skipped_missing_shape_area_ids),
+        "skipped_missing_shape_area_ids": skipped_missing_shape_area_ids,
+        "skipped_too_few_node_count": len(skipped_too_few_node_area_ids),
+        "skipped_too_few_node_area_ids": skipped_too_few_node_area_ids,
+    }
+    return joins, summary
+
+
 def _build_intersection_clusters(
     road_lanelets: dict[str, Lanelet],
     successors: dict[str, list[str]],
@@ -1051,8 +1140,10 @@ def _write_nodes_xml(
     path: Path,
     node_points: dict[str, Point3D],
     tls_ids_by_node_id: dict[str, str] | None = None,
+    intersection_area_node_joins: list[IntersectionAreaNodeJoin] | None = None,
 ) -> None:
     tls_ids_by_node_id = tls_ids_by_node_id or {}
+    intersection_area_node_joins = intersection_area_node_joins or []
     root = ET.Element("nodes")
     for node_id, point in sorted(node_points.items(), key=lambda item: _sort_key(item[0])):
         node_attributes = {
@@ -1066,6 +1157,19 @@ def _write_nodes_xml(
             node_attributes["tl"] = tls_ids_by_node_id[node_id]
             node_attributes["tlType"] = "static"
         ET.SubElement(root, "node", node_attributes)
+    for node_join in sorted(intersection_area_node_joins, key=lambda join: _sort_key(join.join_id)):
+        ET.SubElement(
+            root,
+            "join",
+            {
+                "id": node_join.join_id,
+                "nodes": " ".join(node_join.node_ids),
+                "x": f"{node_join.point.x:.3f}",
+                "y": f"{node_join.point.y:.3f}",
+                "z": f"{node_join.point.z:.3f}",
+                "shape": _shape_xy_string(node_join.shape),
+            },
+        )
     tree = ET.ElementTree(root)
     ET.indent(tree, space="  ")
     tree.write(path, encoding="utf-8", xml_declaration=True)
@@ -2002,7 +2106,20 @@ def convert_map(
             node_ids,
             lanelet_to_group,
         )
-    _write_nodes_xml(nodes_path, node_points, tls_ids_by_node_id=tls_ids_by_node_id)
+    intersection_area_node_joins, intersection_area_node_join_summary = _build_intersection_area_node_joins(
+        exported_lane_groups,
+        road_lanelets,
+        lanelet_map,
+        node_ids,
+        node_points,
+        signalized_intersection_area_ids,
+    )
+    _write_nodes_xml(
+        nodes_path,
+        node_points,
+        tls_ids_by_node_id=tls_ids_by_node_id,
+        intersection_area_node_joins=intersection_area_node_joins,
+    )
 
     connection_shape_summary = _write_connections_xml(
         connections_path,
@@ -2037,7 +2154,15 @@ def convert_map(
         )
         if build_tls_from_nodes:
             signal_summary.update(net_postprocess._summarize_net_tls(net_path))
-            tls_phase_patch_summary = net_postprocess._patch_net_japanese_tls_phases(net_path)
+            joined_intersection_area_tls_ids = (
+                net_postprocess._joined_intersection_area_tls_ids(net_path)
+                if intersection_area_node_joins
+                else set()
+            )
+            tls_phase_patch_summary = net_postprocess._patch_net_japanese_tls_phases(
+                net_path,
+                excluded_tls_ids=joined_intersection_area_tls_ids,
+            )
             signal_summary["japanese_phase_patch"] = tls_phase_patch_summary
             signal_summary.update(net_postprocess._summarize_net_tls(net_path))
         internal_connection_shape_sync_summary = net_postprocess._sync_internal_lane_shapes_from_connection_shapes(net_path)
@@ -2114,6 +2239,20 @@ def convert_map(
             "tls_ids_by_node_id": dict(sorted(tls_ids_by_node_id.items(), key=lambda item: _sort_key(item[0]))),
             "unmapped_signals": unmapped_signals,
         }
+    sidecar["intersection_area_node_joins"] = {
+        node_join.intersection_area_id: {
+            "join_id": node_join.join_id,
+            "node_ids": list(node_join.node_ids),
+            "centroid": {
+                "x": round(node_join.point.x, 3),
+                "y": round(node_join.point.y, 3),
+                "z": round(node_join.point.z, 3),
+            },
+            "shape_point_count": len(node_join.shape),
+        }
+        for node_join in intersection_area_node_joins
+    }
+    sidecar["intersection_area_node_join_summary"] = intersection_area_node_join_summary
     sidecar_path.write_text(json.dumps(sidecar, indent=2, sort_keys=True), encoding="utf-8")
     report = {
         "input_path": str(input_path),
@@ -2137,6 +2276,7 @@ def convert_map(
         "connection_shape_summary": connection_shape_summary,
         "lane_change_summary": lane_change_analysis.summary,
         "signal_summary": signal_summary,
+        "intersection_area_node_join_summary": intersection_area_node_join_summary,
         "geo_reference": _geo_reference_dict(lanelet_map.geo_reference, geo_location_patched),
     }
     if netconvert_result is not None:
