@@ -209,6 +209,20 @@ def _aligned_internal_connection_shape(
         return None
     return usable_fallback_shape, "tangent_fallback"
 
+def _joined_intersection_connection_shape(
+    connection_points: tuple[Point3D, ...],
+    from_points: tuple[Point3D, ...],
+    to_points: tuple[Point3D, ...],
+) -> tuple[tuple[Point3D, ...], str] | None:
+    if len(connection_points) < 2 or not from_points or not to_points:
+        return None
+    start = from_points[-1]
+    end = to_points[0]
+    usable_shape = _usable_connection_shape((start, *connection_points, end))
+    if usable_shape is None:
+        return None
+    return usable_shape, "joined_preserved"
+
 def _audit_degenerate_internal_lane_shapes(net_path: str | Path) -> dict[str, object]:
     root = ET.parse(net_path).getroot()
     scanned_count = 0
@@ -299,10 +313,39 @@ def _sync_internal_lane_shapes_from_connection_shapes(net_path: str | Path) -> d
         "examples": examples,
     }
 
-def _align_internal_connection_shapes_to_net_lanes(net_path: str | Path) -> dict[str, object]:
+def _plain_connection_shapes(connections_path: str | Path | None) -> dict[tuple[str, str, str, str], tuple[Point3D, ...]]:
+    if connections_path is None:
+        return {}
+    path = Path(connections_path)
+    if not path.exists():
+        return {}
+    root = ET.parse(path).getroot()
+    shapes: dict[tuple[str, str, str, str], tuple[Point3D, ...]] = {}
+    for connection_element in root.findall("connection"):
+        connection_shape = connection_element.attrib.get("shape")
+        if not connection_shape:
+            continue
+        from_edge_id = connection_element.attrib.get("from")
+        to_edge_id = connection_element.attrib.get("to")
+        from_lane_index = connection_element.attrib.get("fromLane")
+        to_lane_index = connection_element.attrib.get("toLane")
+        if from_edge_id is None or to_edge_id is None or from_lane_index is None or to_lane_index is None:
+            continue
+        points = _parse_shape_points(connection_shape)
+        usable_shape = _usable_connection_shape(points)
+        if usable_shape is None:
+            continue
+        shapes[(from_edge_id, to_edge_id, from_lane_index, to_lane_index)] = usable_shape
+    return shapes
+
+def _align_internal_connection_shapes_to_net_lanes(
+    net_path: str | Path,
+    plain_connections_path: str | Path | None = None,
+) -> dict[str, object]:
     path = Path(net_path)
     tree = ET.parse(path)
     root = tree.getroot()
+    plain_connection_shapes = _plain_connection_shapes(plain_connections_path)
     lanes_by_id: dict[str, ET.Element] = {
         lane_element.attrib["id"]: lane_element
         for edge_element in root.findall("edge")
@@ -314,9 +357,13 @@ def _align_internal_connection_shapes_to_net_lanes(net_path: str | Path) -> dict
     trimmed_count = 0
     direct_fallback_count = 0
     tangent_fallback_count = 0
+    preserved_joined_count = 0
+    fallback_joined_count = 0
+    plain_joined_shape_count = 0
     unrepaired_count = 0
     max_endpoint_gap_before = 0.0
     max_endpoint_gap_after = 0.0
+    max_joined_endpoint_gap_after = 0.0
     examples: list[dict[str, object]] = []
 
     for connection_element in root.findall("connection"):
@@ -335,14 +382,36 @@ def _align_internal_connection_shapes_to_net_lanes(net_path: str | Path) -> dict
         if not from_points or not to_points:
             continue
         scanned_count += 1
-        connection_points = _parse_shape_points(connection_element.attrib.get("shape", ""))
+        via_lane_id = connection_element.attrib.get("via")
+        is_joined_intersection_connection = bool(via_lane_id and via_lane_id.startswith(":ia_"))
+        plain_connection_points = plain_connection_shapes.get(
+            (
+                from_edge_id,
+                to_edge_id,
+                from_lane_index,
+                to_lane_index,
+            )
+        )
+        if is_joined_intersection_connection and plain_connection_points is not None:
+            connection_points = plain_connection_points
+            plain_joined_shape_count += 1
+        else:
+            connection_points = _parse_shape_points(connection_element.attrib.get("shape", ""))
         if len(connection_points) >= 2:
             before_gap = max(
                 distance_2d(connection_points[0], from_points[-1]),
                 distance_2d(connection_points[-1], to_points[0]),
             )
             max_endpoint_gap_before = max(max_endpoint_gap_before, before_gap)
-        aligned_shape = _aligned_internal_connection_shape(connection_points, from_points, to_points)
+        aligned_shape = (
+            _joined_intersection_connection_shape(connection_points, from_points, to_points)
+            if is_joined_intersection_connection
+            else None
+        )
+        if aligned_shape is None:
+            aligned_shape = _aligned_internal_connection_shape(connection_points, from_points, to_points)
+            if is_joined_intersection_connection:
+                fallback_joined_count += 1
         if aligned_shape is None:
             unrepaired_count += 1
             if len(examples) < MAX_INTERNAL_CONNECTION_ALIGN_EXAMPLES:
@@ -365,9 +434,12 @@ def _align_internal_connection_shapes_to_net_lanes(net_path: str | Path) -> dict
             distance_2d(replacement_points[-1], to_points[0]),
         )
         max_endpoint_gap_after = max(max_endpoint_gap_after, after_gap)
+        if is_joined_intersection_connection:
+            max_joined_endpoint_gap_after = max(max_joined_endpoint_gap_after, after_gap)
+        if source == "joined_preserved":
+            preserved_joined_count += 1
         shape_changed = connection_element.attrib.get("shape") != replacement_shape
         length_changed = connection_element.attrib.get("length") != replacement_length
-        via_lane_id = connection_element.attrib.get("via")
         via_lane_element = lanes_by_id.get(via_lane_id) if via_lane_id else None
         via_changed = (
             via_lane_element is not None
@@ -414,9 +486,13 @@ def _align_internal_connection_shapes_to_net_lanes(net_path: str | Path) -> dict
         "trimmed_connection_shape_count": trimmed_count,
         "direct_fallback_shape_count": direct_fallback_count,
         "tangent_fallback_shape_count": tangent_fallback_count,
+        "preserved_joined_internal_lane_count": preserved_joined_count,
+        "fallback_joined_internal_lane_count": fallback_joined_count,
+        "plain_joined_connection_shape_count": plain_joined_shape_count,
         "unrepaired_connection_count": unrepaired_count,
         "max_endpoint_gap_before_m": round(max_endpoint_gap_before, 6),
         "max_endpoint_gap_after_m": round(max_endpoint_gap_after, 6),
+        "max_joined_internal_endpoint_gap_after_m": round(max_joined_endpoint_gap_after, 6),
         "examples": examples,
     }
 

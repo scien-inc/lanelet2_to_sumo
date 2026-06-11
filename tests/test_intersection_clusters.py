@@ -7,12 +7,14 @@ from pathlib import Path
 
 from ll2sumo.convert import (
     IntersectionCluster,
+    IntersectionAreaNodeJoin,
     LaneGroup,
     _assign_node_ids,
     _collapsed_intersection_group_area_ids,
     _build_intersection_clusters,
     _write_connections_xml,
 )
+from ll2sumo.geometry import polyline_length
 from ll2sumo.model import Lanelet, Point3D
 
 
@@ -141,6 +143,87 @@ class IntersectionClusterTest(unittest.TestCase):
             ]
             self.assertEqual(connections, [("edge_a", "edge_c", "0", "0", "10.000,0.000,0.000 20.000,0.000,0.000", "10.000")])
             self.assertEqual(connection_summary["intersection_area_shape_count"], 1)
+
+    def test_joined_intersection_connection_shape_uses_lanelet_centerline(self) -> None:
+        def custom_lanelet(lanelet_id: str, points: tuple[Point3D, ...], tags: dict[str, str] | None = None) -> Lanelet:
+            lanelet_tags = {
+                "type": "lanelet",
+                "subtype": "road",
+                "speed_limit": "60",
+                "location": "urban",
+                "one_way": "yes",
+            }
+            if tags:
+                lanelet_tags.update(tags)
+            return Lanelet(
+                id=lanelet_id,
+                subtype="road",
+                tags=lanelet_tags,
+                left_way_id=f"{lanelet_id}_left",
+                right_way_id=f"{lanelet_id}_right",
+                regulatory_ids=tuple(),
+                left_node_ids=(f"{lanelet_id}_l0", f"{lanelet_id}_l1"),
+                right_node_ids=(f"{lanelet_id}_r0", f"{lanelet_id}_r1"),
+                left_boundary=points,
+                right_boundary=points,
+                centerline=points,
+                start=points[0],
+                end=points[-1],
+                avg_heading_deg=0.0,
+                length_m=polyline_length(points),
+            )
+
+        road_lanelets = {
+            "a": custom_lanelet("a", (Point3D(0.0, 0.0, 0.0), Point3D(10.0, 0.0, 0.0))),
+            "b": custom_lanelet(
+                "b",
+                (Point3D(10.0, 0.0, 0.0), Point3D(15.0, 5.0, 0.0), Point3D(20.0, 0.0, 0.0)),
+                {"intersection_area": "ia-1", "turn_direction": "left"},
+            ),
+            "c": custom_lanelet("c", (Point3D(20.0, 0.0, 0.0), Point3D(30.0, 0.0, 0.0))),
+        }
+        successors = {"a": ["b"], "b": ["c"]}
+        lanelet_to_group = {"a": "group_a", "b": "group_b", "c": "group_c"}
+        lane_groups = [
+            LaneGroup("group_a", "edge_a", (("a",),), road_lanelets["a"].start, road_lanelets["a"].end, road_lanelets["a"].centerline),
+            LaneGroup("group_b", "edge_b", (("b",),), road_lanelets["b"].start, road_lanelets["b"].end, road_lanelets["b"].centerline),
+            LaneGroup("group_c", "edge_c", (("c",),), road_lanelets["c"].start, road_lanelets["c"].end, road_lanelets["c"].centerline),
+        ]
+        node_join = IntersectionAreaNodeJoin(
+            intersection_area_id="ia-1",
+            join_id="ia_ia-1",
+            node_ids=("node_a_end", "node_b_start", "node_b_end", "node_c_start"),
+            point=Point3D(15.0, 0.0, 0.0),
+            shape=(Point3D(9.0, -1.0, 0.0), Point3D(21.0, -1.0, 0.0), Point3D(21.0, 1.0, 0.0), Point3D(9.0, 1.0, 0.0)),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            connections_path = Path(temp_dir) / "network.con.xml"
+            connection_summary = _write_connections_xml(
+                connections_path,
+                successors,
+                lanelet_to_group,
+                lane_groups,
+                {"a": 0, "b": 0, "c": 0},
+                {},
+                road_lanelets,
+                edge_node_ids_by_edge_id={
+                    "edge_a": ("node_a_start", "node_a_end"),
+                    "edge_b": ("node_b_start", "node_b_end"),
+                    "edge_c": ("node_c_start", "node_c_end"),
+                },
+                intersection_area_node_joins=[node_join],
+            )
+
+            self.assertEqual(connection_summary["joined_intersection_area_shape_count"], 1)
+            root = ET.parse(connections_path).getroot()
+            direct_connection = root.find("connection[@from='edge_a'][@to='edge_c']")
+            self.assertIsNotNone(direct_connection)
+            assert direct_connection is not None
+            self.assertEqual(
+                direct_connection.attrib["shape"],
+                "10.000,0.000,0.000 15.000,5.000,0.000 20.000,0.000,0.000",
+            )
 
     def test_mixed_group_is_not_collapsed(self) -> None:
         road_lanelets = {
