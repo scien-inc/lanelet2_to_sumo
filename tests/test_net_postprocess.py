@@ -210,6 +210,46 @@ class NetPostprocessTest(unittest.TestCase):
             self.assertEqual(connection.attrib["shape"], "2.000,0.000,0.000 3.000,0.000,0.000 4.000,0.000,0.000")
             self.assertEqual(connection.attrib["length"], "2.000")
 
+    def test_joined_intersection_alignment_preserves_connection_shape_middle_points(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            net_path = Path(temp_dir) / "network.net.xml"
+            connections_path = Path(temp_dir) / "network.con.xml"
+            net_path.write_text(
+                """<?xml version="1.0" encoding="utf-8"?>
+<net>
+  <edge id="from_edge"><lane id="from_edge_0" index="0" speed="13.9" length="1.0" shape="-1,0,0 0,0,0"/></edge>
+  <edge id="to_edge"><lane id="to_edge_0" index="0" speed="13.9" length="1.0" shape="10,0,0 11,0,0"/></edge>
+  <edge id=":ia_100_0" function="internal">
+    <lane id=":ia_100_0_0" index="0" speed="13.9" length="1.0" shape="4,0,0 10,0,0"/>
+  </edge>
+  <connection from="from_edge" to="to_edge" fromLane="0" toLane="0" via=":ia_100_0_0" shape="4,0,0 10,0,0" length="6.0"/>
+</net>
+""",
+                encoding="utf-8",
+            )
+            connections_path.write_text(
+                """<?xml version="1.0" encoding="utf-8"?>
+<connections>
+  <connection from="from_edge" to="to_edge" fromLane="0" toLane="0" shape="4,0,0 5,5,0 10,0,0" length="8.1"/>
+</connections>
+""",
+                encoding="utf-8",
+            )
+
+            summary = _align_internal_connection_shapes_to_net_lanes(
+                net_path,
+                plain_connections_path=connections_path,
+            )
+
+            self.assertEqual(summary["preserved_joined_internal_lane_count"], 1)
+            self.assertEqual(summary["fallback_joined_internal_lane_count"], 0)
+            self.assertEqual(summary["plain_joined_connection_shape_count"], 1)
+            self.assertEqual(summary["max_joined_internal_endpoint_gap_after_m"], 0.0)
+            self.assertEqual(self._shape_xy(net_path, ":ia_100_0_0"), [(0.0, 0.0), (4.0, 0.0), (5.0, 5.0), (10.0, 0.0)])
+            connection = ET.parse(net_path).getroot().find("connection")
+            assert connection is not None
+            self.assertEqual(connection.attrib["shape"], "0.000,0.000,0.000 4.000,0.000,0.000 5.000,5.000,0.000 10.000,0.000,0.000")
+
     def test_internal_connection_shape_keeps_minimum_length_for_close_endpoints(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             net_path = Path(temp_dir) / "network.net.xml"
