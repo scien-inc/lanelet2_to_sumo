@@ -2286,15 +2286,7 @@ def convert_map(
             joined_unmapped_connection_cleanup_summary["joined_unmapped_connection_count_after"] = 0
         if build_tls_from_nodes:
             signal_summary.update(net_postprocess._summarize_net_tls(net_path))
-            joined_intersection_area_tls_ids = (
-                net_postprocess._joined_intersection_area_tls_ids(net_path)
-                if intersection_area_node_joins
-                else set()
-            )
-            tls_phase_patch_summary = net_postprocess._patch_net_japanese_tls_phases(
-                net_path,
-                excluded_tls_ids=joined_intersection_area_tls_ids,
-            )
+            tls_phase_patch_summary = net_postprocess._patch_net_japanese_tls_phases(net_path)
             signal_summary["japanese_phase_patch"] = tls_phase_patch_summary
             signal_summary.update(net_postprocess._summarize_net_tls(net_path))
         internal_connection_shape_sync_summary = net_postprocess._sync_internal_lane_shapes_from_connection_shapes(net_path)

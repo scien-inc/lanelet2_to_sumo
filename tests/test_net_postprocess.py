@@ -7,11 +7,11 @@ from pathlib import Path
 
 from ll2sumo.net_postprocess import (
     _align_internal_connection_shapes_to_net_lanes,
-    _joined_intersection_area_tls_ids,
     _patch_net_japanese_tls_phases,
     _patch_net_lane_lengths_to_shape,
     _repair_degenerate_internal_lane_shapes,
     _summarize_joined_unmapped_connections,
+    _summarize_tls_phase_sync,
     _sync_internal_lane_shapes_from_connection_shapes,
     _summarize_net_connectivity_and_write_safe_weights,
     _write_joined_unmapped_connection_deletions,
@@ -356,7 +356,10 @@ class NetPostprocessTest(unittest.TestCase):
   <edge id="edge_s"><lane id="edge_s_0" index="0" shape="0,-10,0 0,0,0"/></edge>
   <edge id="edge_n"><lane id="edge_n_0" index="0" shape="0,10,0 0,0,0"/></edge>
   <edge id="out_w"><lane id="out_w_0" index="0" shape="0,0,0 -10,0,0"/></edge>
-  <edge id="out_e"><lane id="out_e_0" index="0" shape="0,0,0 10,0,0"/></edge>
+  <edge id="out_e">
+    <lane id="out_e_0" index="0" shape="0,0,0 10,0,0"/>
+    <lane id="out_e_1" index="1" shape="0,1,0 10,1,0"/>
+  </edge>
   <edge id="out_s"><lane id="out_s_0" index="0" shape="0,0,0 0,-10,0"/></edge>
   <edge id="out_n"><lane id="out_n_0" index="0" shape="0,0,0 0,10,0"/></edge>
   <tlLogic id="tls_jp" type="static" programID="0" offset="0">
@@ -380,7 +383,7 @@ class NetPostprocessTest(unittest.TestCase):
             self.assertIn("rrGG", states)
             self.assertNotIn("GGGG", states)
 
-    def test_japanese_tls_phase_patch_skips_joined_intersection_area_tls(self) -> None:
+    def test_japanese_tls_phase_patch_syncs_joined_intersection_area_tls(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             net_path = Path(temp_dir) / "network.net.xml"
             net_path.write_text(
@@ -413,10 +416,7 @@ class NetPostprocessTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            summary = _patch_net_japanese_tls_phases(
-                net_path,
-                excluded_tls_ids=_joined_intersection_area_tls_ids(net_path),
-            )
+            summary = _patch_net_japanese_tls_phases(net_path)
 
             root = ET.parse(net_path).getroot()
             joined_states = [
@@ -427,9 +427,10 @@ class NetPostprocessTest(unittest.TestCase):
                 phase.attrib["state"]
                 for phase in root.findall(".//tlLogic[@id='tls_regular']/phase")
             ]
-            self.assertEqual(summary["patched_tls_ids"], ["tls_regular"])
-            self.assertEqual(summary["skipped_excluded_tls_ids"], ["tls_joined"])
-            self.assertEqual(joined_states, ["GGGG"])
+            self.assertEqual(summary["patched_tls_ids"], ["tls_joined", "tls_regular"])
+            self.assertEqual(summary["skipped_excluded_tls_ids"], [])
+            self.assertIn("GGrr", joined_states)
+            self.assertIn("rrGG", joined_states)
             self.assertIn("GGrr", regular_states)
             self.assertIn("rrGG", regular_states)
 
@@ -467,7 +468,112 @@ class NetPostprocessTest(unittest.TestCase):
                 for phase in ET.parse(net_path).getroot().findall(".//tlLogic[@id='tls_jp']/phase")
             ]
             self.assertIn("GGrrg", states)
-            self.assertIn("rrrrG", states)
+            self.assertNotIn("rrrrG", states)
+
+    def test_japanese_tls_phase_patch_keeps_same_incoming_lane_links_together(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            net_path = Path(temp_dir) / "network.net.xml"
+            net_path.write_text(
+                """<?xml version="1.0" encoding="utf-8"?>
+<net>
+  <edge id="edge_w"><lane id="edge_w_0" index="0" shape="-10,0,0 0,0,0"/></edge>
+  <edge id="edge_e"><lane id="edge_e_0" index="0" shape="10,0,0 0,0,0"/></edge>
+  <edge id="edge_s"><lane id="edge_s_0" index="0" shape="0,-10,0 0,0,0"/></edge>
+  <edge id="out_e"><lane id="out_e_0" index="0" shape="0,0,0 10,0,0"/></edge>
+  <edge id="out_s"><lane id="out_s_0" index="0" shape="0,0,0 0,-10,0"/></edge>
+  <edge id="out_w"><lane id="out_w_0" index="0" shape="0,0,0 -10,0,0"/></edge>
+  <tlLogic id="tls_jp" type="static" programID="0" offset="0">
+    <phase duration="90" state="Grr"/>
+    <phase duration="90" state="rGr"/>
+  </tlLogic>
+  <connection from="edge_w" to="out_e" fromLane="0" toLane="0" tl="tls_jp" linkIndex="0" dir="s"/>
+  <connection from="edge_w" to="out_s" fromLane="0" toLane="0" tl="tls_jp" linkIndex="1" dir="r"/>
+  <connection from="edge_s" to="out_w" fromLane="0" toLane="0" tl="tls_jp" linkIndex="2" dir="s"/>
+</net>
+""",
+                encoding="utf-8",
+            )
+
+            before = _summarize_tls_phase_sync(net_path)
+            summary = _patch_net_japanese_tls_phases(net_path)
+            after = _summarize_tls_phase_sync(net_path)
+
+            self.assertEqual(before["mixed_same_incoming_lane_phase_count"], 2)
+            self.assertEqual(summary["mixed_same_incoming_lane_phase_count_after"], 0)
+            self.assertEqual(after["mixed_same_incoming_lane_phase_count"], 0)
+            states = [
+                phase.attrib["state"]
+                for phase in ET.parse(net_path).getroot().findall(".//tlLogic[@id='tls_jp']/phase")
+            ]
+            self.assertIn("Ggr", states)
+            self.assertNotIn("Grr", states)
+            self.assertNotIn("rGr", states)
+
+    def test_japanese_tls_phase_patch_syncs_same_heading_approaches(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            net_path = Path(temp_dir) / "network.net.xml"
+            net_path.write_text(
+                """<?xml version="1.0" encoding="utf-8"?>
+<net>
+  <edge id="edge_w0"><lane id="edge_w0_0" index="0" shape="-10,0,0 0,0,0"/></edge>
+  <edge id="edge_w1"><lane id="edge_w1_0" index="0" shape="-10,1,0 0,1,0"/></edge>
+  <edge id="edge_e"><lane id="edge_e_0" index="0" shape="10,0,0 0,0,0"/></edge>
+  <edge id="edge_s"><lane id="edge_s_0" index="0" shape="0,-10,0 0,0,0"/></edge>
+  <edge id="out_e"><lane id="out_e_0" index="0" shape="0,0,0 10,0,0"/></edge>
+  <edge id="out_w"><lane id="out_w_0" index="0" shape="0,0,0 -10,0,0"/></edge>
+  <edge id="out_n"><lane id="out_n_0" index="0" shape="0,0,0 0,10,0"/></edge>
+  <tlLogic id="tls_jp" type="static" programID="0" offset="0">
+    <phase duration="90" state="Grrr"/>
+  </tlLogic>
+  <connection from="edge_w0" to="out_e" fromLane="0" toLane="0" tl="tls_jp" linkIndex="0" dir="s"/>
+  <connection from="edge_w1" to="out_e" fromLane="0" toLane="1" tl="tls_jp" linkIndex="1" dir="s"/>
+  <connection from="edge_e" to="out_w" fromLane="0" toLane="0" tl="tls_jp" linkIndex="2" dir="s"/>
+  <connection from="edge_s" to="out_n" fromLane="0" toLane="0" tl="tls_jp" linkIndex="3" dir="s"/>
+</net>
+""",
+                encoding="utf-8",
+            )
+
+            summary = _patch_net_japanese_tls_phases(net_path)
+
+            self.assertEqual(summary["mixed_same_approach_phase_count_after"], 0)
+            states = [
+                phase.attrib["state"]
+                for phase in ET.parse(net_path).getroot().findall(".//tlLogic[@id='tls_jp']/phase")
+            ]
+            self.assertIn("GGGr", states)
+            self.assertIn("rrrG", states)
+
+    def test_japanese_tls_phase_patch_marks_shared_target_lane_links_permissive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            net_path = Path(temp_dir) / "network.net.xml"
+            net_path.write_text(
+                """<?xml version="1.0" encoding="utf-8"?>
+<net>
+  <edge id="edge_w0"><lane id="edge_w0_0" index="0" shape="-10,0,0 0,0,0"/></edge>
+  <edge id="edge_w1"><lane id="edge_w1_0" index="0" shape="-10,1,0 0,1,0"/></edge>
+  <edge id="edge_s"><lane id="edge_s_0" index="0" shape="0,-10,0 0,0,0"/></edge>
+  <edge id="out_e"><lane id="out_e_0" index="0" shape="0,0,0 10,0,0"/></edge>
+  <edge id="out_n"><lane id="out_n_0" index="0" shape="0,0,0 0,10,0"/></edge>
+  <tlLogic id="tls_jp" type="static" programID="0" offset="0">
+    <phase duration="90" state="GGG"/>
+  </tlLogic>
+  <connection from="edge_w0" to="out_e" fromLane="0" toLane="0" tl="tls_jp" linkIndex="0" dir="s"/>
+  <connection from="edge_w1" to="out_e" fromLane="0" toLane="0" tl="tls_jp" linkIndex="1" dir="s"/>
+  <connection from="edge_s" to="out_n" fromLane="0" toLane="0" tl="tls_jp" linkIndex="2" dir="s"/>
+</net>
+""",
+                encoding="utf-8",
+            )
+
+            _patch_net_japanese_tls_phases(net_path)
+
+            states = [
+                phase.attrib["state"]
+                for phase in ET.parse(net_path).getroot().findall(".//tlLogic[@id='tls_jp']/phase")
+            ]
+            self.assertIn("ggr", states)
+            self.assertNotIn("GGr", states)
 
 
 if __name__ == "__main__":
