@@ -21,6 +21,7 @@ from ll2sumo.sumo_xml import usable_connection_shape as _usable_connection_shape
 
 MIN_SUMO_LANE_LENGTH_M, DEGENERATE_INTERNAL_LANE_XY_LENGTH_M = 0.1, 0.01
 REPAIRED_INTERNAL_LANE_FALLBACK_LENGTH_M, MAX_INTERNAL_CONNECTION_ALIGN_EXAMPLES = 0.25, 20
+MAX_JOINED_UNMAPPED_CONNECTION_EXAMPLES = 20
 JP_TLS_GREEN_TIME_S, JP_TLS_RIGHT_TURN_TIME_S, JP_TLS_YELLOW_TIME_S, JP_TLS_ALL_RED_TIME_S = 35, 8, 3, 2
 JP_TLS_AXIS_CLUSTER_THRESHOLD_DEG = 35.0
 
@@ -337,6 +338,101 @@ def _plain_connection_shapes(connections_path: str | Path | None) -> dict[tuple[
             continue
         shapes[(from_edge_id, to_edge_id, from_lane_index, to_lane_index)] = usable_shape
     return shapes
+
+def _connection_key(connection_element: ET.Element) -> tuple[str, str, str, str] | None:
+    from_edge_id = connection_element.attrib.get("from")
+    to_edge_id = connection_element.attrib.get("to")
+    from_lane_index = connection_element.attrib.get("fromLane")
+    to_lane_index = connection_element.attrib.get("toLane")
+    if from_edge_id is None or to_edge_id is None or from_lane_index is None or to_lane_index is None:
+        return None
+    return from_edge_id, to_edge_id, from_lane_index, to_lane_index
+
+def _plain_connection_keys(connections_path: str | Path) -> set[tuple[str, str, str, str]]:
+    root = ET.parse(connections_path).getroot()
+    keys: set[tuple[str, str, str, str]] = set()
+    for connection_element in root.findall("connection"):
+        connection_key = _connection_key(connection_element)
+        if connection_key is not None:
+            keys.add(connection_key)
+    return keys
+
+def _joined_unmapped_connection_keys(
+    net_path: str | Path,
+    plain_connections_path: str | Path,
+) -> list[tuple[str, str, str, str]]:
+    plain_keys = _plain_connection_keys(plain_connections_path)
+    root = ET.parse(net_path).getroot()
+    keys: set[tuple[str, str, str, str]] = set()
+    for connection_element in root.findall("connection"):
+        via_lane_id = connection_element.attrib.get("via", "")
+        if not via_lane_id.startswith(":ia_"):
+            continue
+        connection_key = _connection_key(connection_element)
+        if connection_key is None:
+            continue
+        from_edge_id, to_edge_id, _, _ = connection_key
+        if from_edge_id.startswith(":") or to_edge_id.startswith(":"):
+            continue
+        if connection_key in plain_keys:
+            continue
+        keys.add(connection_key)
+    return sorted(keys, key=lambda key: (_sort_key(key[0]), _sort_key(key[1]), int(key[2]), int(key[3])))
+
+def _joined_unmapped_connection_examples(
+    keys: list[tuple[str, str, str, str]],
+) -> list[dict[str, str]]:
+    return [
+        {
+            "from": from_edge_id,
+            "to": to_edge_id,
+            "fromLane": from_lane_index,
+            "toLane": to_lane_index,
+        }
+        for from_edge_id, to_edge_id, from_lane_index, to_lane_index in keys[:MAX_JOINED_UNMAPPED_CONNECTION_EXAMPLES]
+    ]
+
+def _summarize_joined_unmapped_connections(
+    net_path: str | Path,
+    plain_connections_path: str | Path,
+) -> dict[str, object]:
+    keys = _joined_unmapped_connection_keys(net_path, plain_connections_path)
+    return {
+        "joined_unmapped_connection_count": len(keys),
+        "examples": _joined_unmapped_connection_examples(keys),
+    }
+
+def _write_joined_unmapped_connection_deletions(
+    net_path: str | Path,
+    plain_connections_path: str | Path,
+    delete_connections_path: str | Path,
+) -> dict[str, object]:
+    keys = _joined_unmapped_connection_keys(net_path, plain_connections_path)
+    path = Path(delete_connections_path)
+    root = ET.Element("connections")
+    for from_edge_id, to_edge_id, from_lane_index, to_lane_index in keys:
+        ET.SubElement(
+            root,
+            "delete",
+            {
+                "from": from_edge_id,
+                "to": to_edge_id,
+                "fromLane": from_lane_index,
+                "toLane": to_lane_index,
+            },
+        )
+    if keys:
+        tree = ET.ElementTree(root)
+        ET.indent(tree, space="    ")
+        tree.write(path, encoding="utf-8", xml_declaration=True)
+    elif path.exists():
+        path.unlink()
+    return {
+        "joined_unmapped_connection_count_before": len(keys),
+        "deleted_joined_unmapped_connection_count": len(keys),
+        "delete_connections_path": str(path) if keys else None,
+        "examples": _joined_unmapped_connection_examples(keys),
+    }
 
 def _align_internal_connection_shapes_to_net_lanes(
     net_path: str | Path,

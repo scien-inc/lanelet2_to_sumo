@@ -11,8 +11,10 @@ from ll2sumo.net_postprocess import (
     _patch_net_japanese_tls_phases,
     _patch_net_lane_lengths_to_shape,
     _repair_degenerate_internal_lane_shapes,
+    _summarize_joined_unmapped_connections,
     _sync_internal_lane_shapes_from_connection_shapes,
     _summarize_net_connectivity_and_write_safe_weights,
+    _write_joined_unmapped_connection_deletions,
 )
 
 
@@ -249,6 +251,45 @@ class NetPostprocessTest(unittest.TestCase):
             connection = ET.parse(net_path).getroot().find("connection")
             assert connection is not None
             self.assertEqual(connection.attrib["shape"], "0.000,0.000,0.000 4.000,0.000,0.000 5.000,5.000,0.000 10.000,0.000,0.000")
+
+    def test_joined_unmapped_connection_deletions_only_target_extra_joined_external_links(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            net_path = Path(temp_dir) / "network.net.xml"
+            connections_path = Path(temp_dir) / "network.con.xml"
+            delete_path = Path(temp_dir) / "network.joined-delete.con.xml"
+            net_path.write_text(
+                """<?xml version="1.0" encoding="utf-8"?>
+<net>
+  <connection from="edge_a" to="edge_b" fromLane="0" toLane="0" via=":ia_100_0_0"/>
+  <connection from="edge_a" to="edge_b" fromLane="0" toLane="1" via=":ia_100_0_1"/>
+  <connection from="edge_a" to="edge_c" fromLane="0" toLane="0" via=":node_1_0_0"/>
+  <connection from=":ia_100_0" to="edge_b" fromLane="0" toLane="0"/>
+</net>
+""",
+                encoding="utf-8",
+            )
+            connections_path.write_text(
+                """<?xml version="1.0" encoding="utf-8"?>
+<connections>
+  <connection from="edge_a" to="edge_b" fromLane="0" toLane="0"/>
+</connections>
+""",
+                encoding="utf-8",
+            )
+
+            summary = _write_joined_unmapped_connection_deletions(net_path, connections_path, delete_path)
+
+            self.assertEqual(summary["joined_unmapped_connection_count_before"], 1)
+            self.assertEqual(summary["deleted_joined_unmapped_connection_count"], 1)
+            self.assertTrue(delete_path.exists())
+            deletes = ET.parse(delete_path).getroot().findall("delete")
+            self.assertEqual(len(deletes), 1)
+            self.assertEqual(
+                deletes[0].attrib,
+                {"from": "edge_a", "to": "edge_b", "fromLane": "0", "toLane": "1"},
+            )
+            post_summary = _summarize_joined_unmapped_connections(net_path, connections_path)
+            self.assertEqual(post_summary["joined_unmapped_connection_count"], 1)
 
     def test_internal_connection_shape_keeps_minimum_length_for_close_endpoints(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
