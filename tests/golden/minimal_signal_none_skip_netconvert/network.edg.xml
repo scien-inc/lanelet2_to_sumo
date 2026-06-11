@@ -1,0 +1,6 @@
+<?xml version='1.0' encoding='utf-8'?>
+<edges>
+  <edge id="edge_0" from="node_1" to="node_0" numLanes="1" speed="13.889" priority="4" spreadType="center" shape="0.000,0.000,0.000 10.000,0.000,0.000">
+    <lane index="0" speed="13.889" length="10.000" shape="0.000,0.000,0.000 10.000,0.000,0.000" />
+  </edge>
+</edges>
