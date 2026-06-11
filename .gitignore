@@ -1,0 +1,7 @@
+map/
+out/
+reference/
+__pycache__/
+*.pyc
+.DS_Store
+trips.trips.xml

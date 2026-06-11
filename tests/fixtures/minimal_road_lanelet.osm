@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6" generator="ll2sumo-test">
+  <node id="1">
+    <tag k="local_x" v="0.0" />
+    <tag k="local_y" v="1.0" />
+    <tag k="local_z" v="0.0" />
+  </node>
+  <node id="2">
+    <tag k="local_x" v="10.0" />
+    <tag k="local_y" v="1.0" />
+    <tag k="local_z" v="0.0" />
+  </node>
+  <node id="3">
+    <tag k="local_x" v="0.0" />
+    <tag k="local_y" v="-1.0" />
+    <tag k="local_z" v="0.0" />
+  </node>
+  <node id="4">
+    <tag k="local_x" v="10.0" />
+    <tag k="local_y" v="-1.0" />
+    <tag k="local_z" v="0.0" />
+  </node>
+  <way id="10">
+    <nd ref="1" />
+    <nd ref="2" />
+    <tag k="type" v="line_thin" />
+    <tag k="subtype" v="solid" />
+  </way>
+  <way id="20">
+    <nd ref="3" />
+    <nd ref="4" />
+    <tag k="type" v="road_border" />
+  </way>
+  <relation id="100">
+    <member type="way" ref="10" role="left" />
+    <member type="way" ref="20" role="right" />
+    <tag k="type" v="lanelet" />
+    <tag k="subtype" v="road" />
+    <tag k="one_way" v="yes" />
+    <tag k="speed_limit" v="50" />
+  </relation>
+</osm>
