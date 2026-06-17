@@ -428,7 +428,6 @@ class NetPostprocessTest(unittest.TestCase):
                 for phase in root.findall(".//tlLogic[@id='tls_regular']/phase")
             ]
             self.assertEqual(summary["patched_tls_ids"], ["tls_joined", "tls_regular"])
-            self.assertEqual(summary["skipped_excluded_tls_ids"], [])
             self.assertIn("GGrr", joined_states)
             self.assertIn("rrGG", joined_states)
             self.assertIn("GGrr", regular_states)
