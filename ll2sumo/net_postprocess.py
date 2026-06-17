@@ -22,7 +22,7 @@ from ll2sumo.sumo_xml import usable_connection_shape as _usable_connection_shape
 MIN_SUMO_LANE_LENGTH_M, DEGENERATE_INTERNAL_LANE_XY_LENGTH_M = 0.1, 0.01
 REPAIRED_INTERNAL_LANE_FALLBACK_LENGTH_M, MAX_INTERNAL_CONNECTION_ALIGN_EXAMPLES = 0.25, 20
 MAX_JOINED_UNMAPPED_CONNECTION_EXAMPLES = 20
-JP_TLS_GREEN_TIME_S, JP_TLS_RIGHT_TURN_TIME_S, JP_TLS_YELLOW_TIME_S, JP_TLS_ALL_RED_TIME_S = 35, 8, 3, 2
+JP_TLS_GREEN_TIME_S, JP_TLS_YELLOW_TIME_S, JP_TLS_ALL_RED_TIME_S = 35, 3, 2
 JP_TLS_AXIS_CLUSTER_THRESHOLD_DEG = 35.0
 MAX_TLS_PHASE_SYNC_EXAMPLES = 20
 
@@ -41,10 +41,6 @@ class TLSLinkInfo:
     @property
     def has_right_turn(self) -> bool:
         return any(direction in {"r", "R"} for direction in self.directions)
-
-    @property
-    def has_non_right_turn(self) -> bool:
-        return any(direction not in {"r", "R"} for direction in self.directions)
 
 def _summarize_net_tls(net_path: Path) -> dict[str, object]:
     root = ET.parse(net_path).getroot()
@@ -1046,38 +1042,20 @@ def _japanese_tls_phases(link_infos: list[TLSLinkInfo], state_length: int) -> li
 
     return phases or None
 
-def _joined_intersection_area_tls_ids(net_path: str | Path) -> set[str]:
-    root = ET.parse(net_path).getroot()
-    tls_ids: set[str] = set()
-    for connection_element in root.findall("connection"):
-        tl_id = connection_element.attrib.get("tl")
-        via_lane_id = connection_element.attrib.get("via", "")
-        if tl_id and via_lane_id.startswith(":ia_"):
-            tls_ids.add(tl_id)
-    return tls_ids
-
-def _patch_net_japanese_tls_phases(
-    net_path: str | Path,
-    excluded_tls_ids: set[str] | None = None,
-) -> dict[str, object]:
+def _patch_net_japanese_tls_phases(net_path: str | Path) -> dict[str, object]:
     path = Path(net_path)
     tree = ET.parse(path)
     root = tree.getroot()
     link_infos_by_tls = _tls_link_infos(root)
     tl_logic_elements = root.findall("tlLogic")
     before_audit = _tls_phase_sync_audit(tl_logic_elements, link_infos_by_tls)
-    excluded_tls_ids = excluded_tls_ids or set()
     patched_tls_ids: list[str] = []
-    skipped_excluded_tls_ids: list[str] = []
     skipped_single_axis_tls_ids: list[str] = []
     max_phase_count = 0
 
     for tl_logic_element in tl_logic_elements:
         tl_id = tl_logic_element.attrib.get("id")
         if tl_id is None:
-            continue
-        if tl_id in excluded_tls_ids:
-            skipped_excluded_tls_ids.append(tl_id)
             continue
         link_infos = link_infos_by_tls.get(tl_id, [])
         if not link_infos:
@@ -1114,8 +1092,6 @@ def _patch_net_japanese_tls_phases(
         "patched_tls_count": len(patched_tls_ids),
         "patched_tls_ids": patched_tls_ids,
         "approach_synchronized_tls_count": len(patched_tls_ids),
-        "skipped_excluded_tls_count": len(skipped_excluded_tls_ids),
-        "skipped_excluded_tls_ids": skipped_excluded_tls_ids,
         "skipped_single_axis_tls_count": len(skipped_single_axis_tls_ids),
         "max_phase_count": max_phase_count,
         "mixed_same_incoming_lane_phase_count_before": before_audit["mixed_same_incoming_lane_phase_count"],
