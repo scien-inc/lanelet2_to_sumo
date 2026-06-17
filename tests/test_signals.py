@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 from subprocess import CompletedProcess
 from unittest.mock import patch
 import unittest
+import xml.etree.ElementTree as ET
 
 from ll2sumo.convert import (
     IntersectionCluster,
+    LaneGroup,
+    _build_intersection_area_node_joins,
     _lanelet_path_signal_stop_offset_m,
     _plan_vehicle_signals,
     _run_netconvert,
+    _run_netconvert_connection_patch,
     _signalized_intersection_area_ids,
+    _write_nodes_xml,
 )
 from ll2sumo.model import Lanelet, LaneletMap, Point3D, RegulatoryElement, Way
 
@@ -231,6 +237,71 @@ class VehicleSignalPlanningTest(unittest.TestCase):
             {"ia"},
         )
 
+    def test_signalized_intersection_area_node_join_preserves_tls_nodes(self) -> None:
+        road_lanelets = {
+            "c": make_lanelet("c", tags={"intersection_area": "100"}),
+        }
+        exported_groups = [
+            LaneGroup(
+                group_id="group_c",
+                edge_id="edge_c",
+                lanelet_paths=(("c",),),
+                start=road_lanelets["c"].start,
+                end=road_lanelets["c"].end,
+                centerline=road_lanelets["c"].centerline,
+            )
+        ]
+        lanelet_map = LaneletMap(
+            nodes={
+                "p0": Point3D(0.0, -2.0, 0.0),
+                "p1": Point3D(10.0, -2.0, 0.0),
+                "p2": Point3D(10.0, 2.0, 0.0),
+                "p3": Point3D(0.0, 2.0, 0.0),
+                "p4": Point3D(0.0, -2.0, 0.0),
+            },
+            ways={"100": Way(id="100", node_ids=("p0", "p1", "p2", "p3", "p4"), tags={"type": "intersection_area"})},
+            lanelets=road_lanelets,
+        )
+
+        joins, summary = _build_intersection_area_node_joins(
+            exported_groups,
+            road_lanelets,
+            lanelet_map,
+            {"group_c:start": "node_1", "group_c:end": "node_2"},
+            {
+                "node_1": Point3D(0.0, 0.0, 0.0),
+                "node_2": Point3D(10.0, 0.0, 0.0),
+            },
+            {"100"},
+        )
+
+        self.assertEqual(summary["join_count"], 1)
+        self.assertEqual(joins[0].join_id, "ia_100")
+        self.assertEqual(joins[0].node_ids, ("node_1", "node_2"))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            nodes_path = Path(temp_dir) / "network.nod.xml"
+            _write_nodes_xml(
+                nodes_path,
+                {
+                    "node_1": Point3D(0.0, 0.0, 0.0),
+                    "node_2": Point3D(10.0, 0.0, 0.0),
+                },
+                tls_ids_by_node_id={"node_1": "tls_100"},
+                intersection_area_node_joins=joins,
+            )
+
+            root = ET.parse(nodes_path).getroot()
+            join = root.find("join")
+            self.assertIsNotNone(join)
+            assert join is not None
+            self.assertEqual(join.attrib["id"], "ia_100")
+            self.assertEqual(join.attrib["nodes"], "node_1 node_2")
+            self.assertEqual(join.attrib["shape"], "0.000,-2.000 10.000,-2.000 10.000,2.000 0.000,2.000 0.000,-2.000")
+            self.assertNotIn("type", join.attrib)
+            self.assertNotIn("tl", join.attrib)
+            self.assertEqual(root.find("node[@id='node_1']").attrib["tl"], "tls_100")
+
 
 class NetconvertTlsBuildingTest(unittest.TestCase):
     def test_uses_lanelet_stopline_tls_building_options(self) -> None:
@@ -254,6 +325,27 @@ class NetconvertTlsBuildingTest(unittest.TestCase):
         self.assertIn("--tls.default-type", command)
         self.assertNotIn("--tls.guess-signals", command)
         self.assertNotIn("--tllogic-files", command)
+
+    def test_connection_patch_uses_existing_net_and_delete_connections(self) -> None:
+        with patch("ll2sumo.convert.subprocess.run") as run:
+            run.return_value = CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+            _run_netconvert_connection_patch(
+                Path("network.net.xml"),
+                Path("network.joined-delete.con.xml"),
+                Path("network.filtered.net.xml"),
+                "netconvert",
+            )
+
+        command = run.call_args.args[0]
+        self.assertIn("--sumo-net-file", command)
+        self.assertIn("network.net.xml", command)
+        self.assertIn("--connection-files", command)
+        self.assertIn("network.joined-delete.con.xml", command)
+        self.assertIn("--output-file", command)
+        self.assertIn("network.filtered.net.xml", command)
+        self.assertNotIn("--node-files", command)
+        self.assertNotIn("--edge-files", command)
 
 
 if __name__ == "__main__":

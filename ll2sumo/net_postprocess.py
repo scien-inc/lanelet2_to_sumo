@@ -21,14 +21,18 @@ from ll2sumo.sumo_xml import usable_connection_shape as _usable_connection_shape
 
 MIN_SUMO_LANE_LENGTH_M, DEGENERATE_INTERNAL_LANE_XY_LENGTH_M = 0.1, 0.01
 REPAIRED_INTERNAL_LANE_FALLBACK_LENGTH_M, MAX_INTERNAL_CONNECTION_ALIGN_EXAMPLES = 0.25, 20
-JP_TLS_GREEN_TIME_S, JP_TLS_RIGHT_TURN_TIME_S, JP_TLS_YELLOW_TIME_S, JP_TLS_ALL_RED_TIME_S = 35, 8, 3, 2
+MAX_JOINED_UNMAPPED_CONNECTION_EXAMPLES = 20
+JP_TLS_GREEN_TIME_S, JP_TLS_YELLOW_TIME_S, JP_TLS_ALL_RED_TIME_S = 35, 3, 2
 JP_TLS_AXIS_CLUSTER_THRESHOLD_DEG = 35.0
+MAX_TLS_PHASE_SYNC_EXAMPLES = 20
 
 @dataclass(frozen=True)
 class TLSLinkInfo:
     index: int
     incoming_heading_deg: float
     directions: tuple[str, ...]
+    incoming_lane_keys: tuple[tuple[str, str], ...] = tuple()
+    outgoing_lane_keys: tuple[tuple[str, str], ...] = tuple()
 
     @property
     def axis_deg(self) -> float:
@@ -37,10 +41,6 @@ class TLSLinkInfo:
     @property
     def has_right_turn(self) -> bool:
         return any(direction in {"r", "R"} for direction in self.directions)
-
-    @property
-    def has_non_right_turn(self) -> bool:
-        return any(direction not in {"r", "R"} for direction in self.directions)
 
 def _summarize_net_tls(net_path: Path) -> dict[str, object]:
     root = ET.parse(net_path).getroot()
@@ -209,6 +209,20 @@ def _aligned_internal_connection_shape(
         return None
     return usable_fallback_shape, "tangent_fallback"
 
+def _joined_intersection_connection_shape(
+    connection_points: tuple[Point3D, ...],
+    from_points: tuple[Point3D, ...],
+    to_points: tuple[Point3D, ...],
+) -> tuple[tuple[Point3D, ...], str] | None:
+    if len(connection_points) < 2 or not from_points or not to_points:
+        return None
+    start = from_points[-1]
+    end = to_points[0]
+    usable_shape = _usable_connection_shape((start, *connection_points, end))
+    if usable_shape is None:
+        return None
+    return usable_shape, "joined_preserved"
+
 def _audit_degenerate_internal_lane_shapes(net_path: str | Path) -> dict[str, object]:
     root = ET.parse(net_path).getroot()
     scanned_count = 0
@@ -299,10 +313,134 @@ def _sync_internal_lane_shapes_from_connection_shapes(net_path: str | Path) -> d
         "examples": examples,
     }
 
-def _align_internal_connection_shapes_to_net_lanes(net_path: str | Path) -> dict[str, object]:
+def _plain_connection_shapes(connections_path: str | Path | None) -> dict[tuple[str, str, str, str], tuple[Point3D, ...]]:
+    if connections_path is None:
+        return {}
+    path = Path(connections_path)
+    if not path.exists():
+        return {}
+    root = ET.parse(path).getroot()
+    shapes: dict[tuple[str, str, str, str], tuple[Point3D, ...]] = {}
+    for connection_element in root.findall("connection"):
+        connection_shape = connection_element.attrib.get("shape")
+        if not connection_shape:
+            continue
+        from_edge_id = connection_element.attrib.get("from")
+        to_edge_id = connection_element.attrib.get("to")
+        from_lane_index = connection_element.attrib.get("fromLane")
+        to_lane_index = connection_element.attrib.get("toLane")
+        if from_edge_id is None or to_edge_id is None or from_lane_index is None or to_lane_index is None:
+            continue
+        points = _parse_shape_points(connection_shape)
+        usable_shape = _usable_connection_shape(points)
+        if usable_shape is None:
+            continue
+        shapes[(from_edge_id, to_edge_id, from_lane_index, to_lane_index)] = usable_shape
+    return shapes
+
+def _connection_key(connection_element: ET.Element) -> tuple[str, str, str, str] | None:
+    from_edge_id = connection_element.attrib.get("from")
+    to_edge_id = connection_element.attrib.get("to")
+    from_lane_index = connection_element.attrib.get("fromLane")
+    to_lane_index = connection_element.attrib.get("toLane")
+    if from_edge_id is None or to_edge_id is None or from_lane_index is None or to_lane_index is None:
+        return None
+    return from_edge_id, to_edge_id, from_lane_index, to_lane_index
+
+def _plain_connection_keys(connections_path: str | Path) -> set[tuple[str, str, str, str]]:
+    root = ET.parse(connections_path).getroot()
+    keys: set[tuple[str, str, str, str]] = set()
+    for connection_element in root.findall("connection"):
+        connection_key = _connection_key(connection_element)
+        if connection_key is not None:
+            keys.add(connection_key)
+    return keys
+
+def _joined_unmapped_connection_keys(
+    net_path: str | Path,
+    plain_connections_path: str | Path,
+) -> list[tuple[str, str, str, str]]:
+    plain_keys = _plain_connection_keys(plain_connections_path)
+    root = ET.parse(net_path).getroot()
+    keys: set[tuple[str, str, str, str]] = set()
+    for connection_element in root.findall("connection"):
+        via_lane_id = connection_element.attrib.get("via", "")
+        if not via_lane_id.startswith(":ia_"):
+            continue
+        connection_key = _connection_key(connection_element)
+        if connection_key is None:
+            continue
+        from_edge_id, to_edge_id, _, _ = connection_key
+        if from_edge_id.startswith(":") or to_edge_id.startswith(":"):
+            continue
+        if connection_key in plain_keys:
+            continue
+        keys.add(connection_key)
+    return sorted(keys, key=lambda key: (_sort_key(key[0]), _sort_key(key[1]), int(key[2]), int(key[3])))
+
+def _joined_unmapped_connection_examples(
+    keys: list[tuple[str, str, str, str]],
+) -> list[dict[str, str]]:
+    return [
+        {
+            "from": from_edge_id,
+            "to": to_edge_id,
+            "fromLane": from_lane_index,
+            "toLane": to_lane_index,
+        }
+        for from_edge_id, to_edge_id, from_lane_index, to_lane_index in keys[:MAX_JOINED_UNMAPPED_CONNECTION_EXAMPLES]
+    ]
+
+def _summarize_joined_unmapped_connections(
+    net_path: str | Path,
+    plain_connections_path: str | Path,
+) -> dict[str, object]:
+    keys = _joined_unmapped_connection_keys(net_path, plain_connections_path)
+    return {
+        "joined_unmapped_connection_count": len(keys),
+        "examples": _joined_unmapped_connection_examples(keys),
+    }
+
+def _write_joined_unmapped_connection_deletions(
+    net_path: str | Path,
+    plain_connections_path: str | Path,
+    delete_connections_path: str | Path,
+) -> dict[str, object]:
+    keys = _joined_unmapped_connection_keys(net_path, plain_connections_path)
+    path = Path(delete_connections_path)
+    root = ET.Element("connections")
+    for from_edge_id, to_edge_id, from_lane_index, to_lane_index in keys:
+        ET.SubElement(
+            root,
+            "delete",
+            {
+                "from": from_edge_id,
+                "to": to_edge_id,
+                "fromLane": from_lane_index,
+                "toLane": to_lane_index,
+            },
+        )
+    if keys:
+        tree = ET.ElementTree(root)
+        ET.indent(tree, space="    ")
+        tree.write(path, encoding="utf-8", xml_declaration=True)
+    elif path.exists():
+        path.unlink()
+    return {
+        "joined_unmapped_connection_count_before": len(keys),
+        "deleted_joined_unmapped_connection_count": len(keys),
+        "delete_connections_path": str(path) if keys else None,
+        "examples": _joined_unmapped_connection_examples(keys),
+    }
+
+def _align_internal_connection_shapes_to_net_lanes(
+    net_path: str | Path,
+    plain_connections_path: str | Path | None = None,
+) -> dict[str, object]:
     path = Path(net_path)
     tree = ET.parse(path)
     root = tree.getroot()
+    plain_connection_shapes = _plain_connection_shapes(plain_connections_path)
     lanes_by_id: dict[str, ET.Element] = {
         lane_element.attrib["id"]: lane_element
         for edge_element in root.findall("edge")
@@ -314,9 +452,13 @@ def _align_internal_connection_shapes_to_net_lanes(net_path: str | Path) -> dict
     trimmed_count = 0
     direct_fallback_count = 0
     tangent_fallback_count = 0
+    preserved_joined_count = 0
+    fallback_joined_count = 0
+    plain_joined_shape_count = 0
     unrepaired_count = 0
     max_endpoint_gap_before = 0.0
     max_endpoint_gap_after = 0.0
+    max_joined_endpoint_gap_after = 0.0
     examples: list[dict[str, object]] = []
 
     for connection_element in root.findall("connection"):
@@ -335,14 +477,36 @@ def _align_internal_connection_shapes_to_net_lanes(net_path: str | Path) -> dict
         if not from_points or not to_points:
             continue
         scanned_count += 1
-        connection_points = _parse_shape_points(connection_element.attrib.get("shape", ""))
+        via_lane_id = connection_element.attrib.get("via")
+        is_joined_intersection_connection = bool(via_lane_id and via_lane_id.startswith(":ia_"))
+        plain_connection_points = plain_connection_shapes.get(
+            (
+                from_edge_id,
+                to_edge_id,
+                from_lane_index,
+                to_lane_index,
+            )
+        )
+        if is_joined_intersection_connection and plain_connection_points is not None:
+            connection_points = plain_connection_points
+            plain_joined_shape_count += 1
+        else:
+            connection_points = _parse_shape_points(connection_element.attrib.get("shape", ""))
         if len(connection_points) >= 2:
             before_gap = max(
                 distance_2d(connection_points[0], from_points[-1]),
                 distance_2d(connection_points[-1], to_points[0]),
             )
             max_endpoint_gap_before = max(max_endpoint_gap_before, before_gap)
-        aligned_shape = _aligned_internal_connection_shape(connection_points, from_points, to_points)
+        aligned_shape = (
+            _joined_intersection_connection_shape(connection_points, from_points, to_points)
+            if is_joined_intersection_connection
+            else None
+        )
+        if aligned_shape is None:
+            aligned_shape = _aligned_internal_connection_shape(connection_points, from_points, to_points)
+            if is_joined_intersection_connection:
+                fallback_joined_count += 1
         if aligned_shape is None:
             unrepaired_count += 1
             if len(examples) < MAX_INTERNAL_CONNECTION_ALIGN_EXAMPLES:
@@ -365,9 +529,12 @@ def _align_internal_connection_shapes_to_net_lanes(net_path: str | Path) -> dict
             distance_2d(replacement_points[-1], to_points[0]),
         )
         max_endpoint_gap_after = max(max_endpoint_gap_after, after_gap)
+        if is_joined_intersection_connection:
+            max_joined_endpoint_gap_after = max(max_joined_endpoint_gap_after, after_gap)
+        if source == "joined_preserved":
+            preserved_joined_count += 1
         shape_changed = connection_element.attrib.get("shape") != replacement_shape
         length_changed = connection_element.attrib.get("length") != replacement_length
-        via_lane_id = connection_element.attrib.get("via")
         via_lane_element = lanes_by_id.get(via_lane_id) if via_lane_id else None
         via_changed = (
             via_lane_element is not None
@@ -414,9 +581,13 @@ def _align_internal_connection_shapes_to_net_lanes(net_path: str | Path) -> dict
         "trimmed_connection_shape_count": trimmed_count,
         "direct_fallback_shape_count": direct_fallback_count,
         "tangent_fallback_shape_count": tangent_fallback_count,
+        "preserved_joined_internal_lane_count": preserved_joined_count,
+        "fallback_joined_internal_lane_count": fallback_joined_count,
+        "plain_joined_connection_shape_count": plain_joined_shape_count,
         "unrepaired_connection_count": unrepaired_count,
         "max_endpoint_gap_before_m": round(max_endpoint_gap_before, 6),
         "max_endpoint_gap_after_m": round(max_endpoint_gap_after, 6),
+        "max_joined_internal_endpoint_gap_after_m": round(max_joined_endpoint_gap_after, 6),
         "examples": examples,
     }
 
@@ -559,6 +730,17 @@ def _angle_axis_diff_deg(lhs: float, rhs: float) -> float:
     diff = abs((lhs - rhs) % 180.0)
     return min(diff, 180.0 - diff)
 
+def _angle_diff_deg(lhs: float, rhs: float) -> float:
+    diff = abs((lhs - rhs) % 360.0)
+    return min(diff, 360.0 - diff)
+
+def _mean_heading_deg(headings: list[float]) -> float:
+    if not headings:
+        return 0.0
+    x = sum(math.cos(math.radians(heading)) for heading in headings)
+    y = sum(math.sin(math.radians(heading)) for heading in headings)
+    return math.degrees(math.atan2(y, x)) % 360.0
+
 def _mean_axis_deg(axes: list[float]) -> float:
     if not axes:
         return 0.0
@@ -588,6 +770,28 @@ def _axis_clusters(link_infos: list[TLSLinkInfo]) -> list[tuple[float, set[int]]
         )
     return sorted(clusters, key=lambda item: item[0])
 
+def _approach_clusters(link_infos: list[TLSLinkInfo]) -> list[tuple[float, set[int]]]:
+    clusters: list[tuple[float, set[int]]] = []
+    headings_by_index = {link.index: link.incoming_heading_deg for link in link_infos}
+    for link in sorted(link_infos, key=lambda item: (item.incoming_heading_deg, item.index)):
+        best_index: int | None = None
+        best_diff = math.inf
+        for cluster_index, (heading, _) in enumerate(clusters):
+            diff = _angle_diff_deg(link.incoming_heading_deg, heading)
+            if diff < best_diff:
+                best_diff = diff
+                best_index = cluster_index
+        if best_index is None or best_diff > JP_TLS_AXIS_CLUSTER_THRESHOLD_DEG:
+            clusters.append((link.incoming_heading_deg, {link.index}))
+            continue
+        _, member_indices = clusters[best_index]
+        member_indices.add(link.index)
+        clusters[best_index] = (
+            _mean_heading_deg([headings_by_index[index] for index in member_indices]),
+            member_indices,
+        )
+    return sorted(clusters, key=lambda item: item[0])
+
 def _edge_lane_shapes(root: ET.Element) -> dict[str, tuple[Point3D, ...]]:
     edge_shapes: dict[str, tuple[Point3D, ...]] = {}
     for edge_element in root.findall("edge"):
@@ -603,6 +807,32 @@ def _edge_lane_shapes(root: ET.Element) -> dict[str, tuple[Point3D, ...]]:
             edge_shapes[edge_id] = points
     return edge_shapes
 
+def _normal_lane_shapes(root: ET.Element) -> dict[tuple[str, str], tuple[Point3D, ...]]:
+    lane_shapes: dict[tuple[str, str], tuple[Point3D, ...]] = {}
+    for edge_element in root.findall("edge"):
+        edge_id = edge_element.attrib.get("id")
+        if not edge_id or edge_id.startswith(":"):
+            continue
+        for lane_element in edge_element.findall("lane"):
+            lane_index = lane_element.attrib.get("index")
+            shape = lane_element.attrib.get("shape")
+            if lane_index is None or not shape:
+                continue
+            points = _parse_shape_points(shape)
+            if len(points) >= 2:
+                lane_shapes[(edge_id, lane_index)] = points
+    return lane_shapes
+
+def _phase_signal_color(state: str, index: int) -> str | None:
+    if index >= len(state):
+        return None
+    signal = state[index]
+    if signal in {"G", "g"}:
+        return "green"
+    if signal == "r":
+        return "red"
+    return None
+
 def _incoming_heading_from_shape(points: tuple[Point3D, ...]) -> float | None:
     for start, end in zip(reversed(points[:-1]), reversed(points[1:])):
         if distance_2d(start, end) > 0.01:
@@ -611,14 +841,26 @@ def _incoming_heading_from_shape(points: tuple[Point3D, ...]) -> float | None:
 
 def _tls_link_infos(root: ET.Element) -> dict[str, list[TLSLinkInfo]]:
     edge_shapes = _edge_lane_shapes(root)
+    lane_shapes = _normal_lane_shapes(root)
     raw_links: dict[str, dict[int, dict[str, object]]] = defaultdict(dict)
     for connection_element in root.findall("connection"):
         tl_id = connection_element.attrib.get("tl")
         link_index = connection_element.attrib.get("linkIndex")
         from_edge_id = connection_element.attrib.get("from")
-        if tl_id is None or link_index is None or from_edge_id is None or from_edge_id.startswith(":"):
+        from_lane_index = connection_element.attrib.get("fromLane")
+        to_edge_id = connection_element.attrib.get("to")
+        to_lane_index = connection_element.attrib.get("toLane")
+        if (
+            tl_id is None
+            or link_index is None
+            or from_edge_id is None
+            or from_lane_index is None
+            or to_edge_id is None
+            or to_lane_index is None
+            or from_edge_id.startswith(":")
+        ):
             continue
-        shape = edge_shapes.get(from_edge_id)
+        shape = lane_shapes.get((from_edge_id, from_lane_index)) or edge_shapes.get(from_edge_id)
         if shape is None:
             continue
         incoming_heading = _incoming_heading_from_shape(shape)
@@ -633,10 +875,14 @@ def _tls_link_infos(root: ET.Element) -> dict[str, list[TLSLinkInfo]]:
             {
                 "headings": [],
                 "directions": set(),
+                "incoming_lane_keys": set(),
+                "outgoing_lane_keys": set(),
             },
         )
         link_entry["headings"].append(incoming_heading)
         link_entry["directions"].add(connection_element.attrib.get("dir", "s"))
+        link_entry["incoming_lane_keys"].add((from_edge_id, from_lane_index))
+        link_entry["outgoing_lane_keys"].add((to_edge_id, to_lane_index))
 
     result: dict[str, list[TLSLinkInfo]] = {}
     for tl_id, links_by_index in raw_links.items():
@@ -653,6 +899,8 @@ def _tls_link_infos(root: ET.Element) -> dict[str, list[TLSLinkInfo]]:
                     index=index,
                     incoming_heading_deg=incoming_heading,
                     directions=tuple(sorted(link_entry["directions"])),
+                    incoming_lane_keys=tuple(sorted(link_entry["incoming_lane_keys"])),
+                    outgoing_lane_keys=tuple(sorted(link_entry["outgoing_lane_keys"])),
                 )
             )
         if link_infos:
@@ -671,11 +919,107 @@ def _phase_state(length: int, active_indices: set[int], right_turn_indices: set[
             chars.append("G")
     return "".join(chars)
 
+def _shared_target_lane_indices(active_indices: set[int], links_by_index: dict[int, TLSLinkInfo]) -> set[int]:
+    indices_by_target: dict[tuple[str, str], set[int]] = defaultdict(set)
+    for index in active_indices:
+        link = links_by_index.get(index)
+        if link is None:
+            continue
+        for target_lane_key in link.outgoing_lane_keys:
+            indices_by_target[target_lane_key].add(index)
+    return {
+        index
+        for indices in indices_by_target.values()
+        if len(indices) > 1
+        for index in indices
+    }
+
+def _tls_phase_sync_audit(
+    tl_logic_elements: list[ET.Element],
+    link_infos_by_tls: dict[str, list[TLSLinkInfo]],
+) -> dict[str, object]:
+    mixed_lane_count = 0
+    mixed_approach_count = 0
+    examples: list[dict[str, object]] = []
+
+    for tl_logic_element in tl_logic_elements:
+        tl_id = tl_logic_element.attrib.get("id")
+        if tl_id is None:
+            continue
+        link_infos = link_infos_by_tls.get(tl_id, [])
+        if not link_infos:
+            continue
+        lane_keys_by_index = {
+            link.index: link.incoming_lane_keys
+            for link in link_infos
+        }
+        approach_indices = [
+            member_indices
+            for _, member_indices in _approach_clusters(link_infos)
+        ]
+
+        for phase_index, phase_element in enumerate(tl_logic_element.findall("phase")):
+            state = phase_element.attrib.get("state", "")
+            colors_by_lane: dict[tuple[str, str], set[str]] = defaultdict(set)
+            for link in link_infos:
+                color = _phase_signal_color(state, link.index)
+                if color is None:
+                    continue
+                for lane_key in lane_keys_by_index.get(link.index, tuple()):
+                    colors_by_lane[lane_key].add(color)
+            for (from_edge_id, from_lane_index), colors in sorted(colors_by_lane.items(), key=lambda item: (_sort_key(item[0][0]), int(item[0][1]))):
+                if colors != {"red", "green"}:
+                    continue
+                mixed_lane_count += 1
+                if len(examples) < MAX_TLS_PHASE_SYNC_EXAMPLES:
+                    examples.append(
+                        {
+                            "type": "incoming_lane",
+                            "tl": tl_id,
+                            "phase_index": phase_index,
+                            "from": from_edge_id,
+                            "fromLane": from_lane_index,
+                            "state": state,
+                        }
+                    )
+
+            for approach_index, member_indices in enumerate(approach_indices):
+                colors = {
+                    color
+                    for link_index in member_indices
+                    for color in [_phase_signal_color(state, link_index)]
+                    if color is not None
+                }
+                if colors != {"red", "green"}:
+                    continue
+                mixed_approach_count += 1
+                if len(examples) < MAX_TLS_PHASE_SYNC_EXAMPLES:
+                    examples.append(
+                        {
+                            "type": "approach",
+                            "tl": tl_id,
+                            "phase_index": phase_index,
+                            "approach_index": approach_index,
+                            "state": state,
+                        }
+                    )
+
+    return {
+        "mixed_same_incoming_lane_phase_count": mixed_lane_count,
+        "mixed_same_approach_phase_count": mixed_approach_count,
+        "examples": examples,
+    }
+
+def _summarize_tls_phase_sync(net_path: str | Path) -> dict[str, object]:
+    root = ET.parse(net_path).getroot()
+    link_infos_by_tls = _tls_link_infos(root)
+    return _tls_phase_sync_audit(root.findall("tlLogic"), link_infos_by_tls)
+
 def _japanese_tls_phases(link_infos: list[TLSLinkInfo], state_length: int) -> list[tuple[int, str]] | None:
     if not link_infos:
         return None
     clusters = _axis_clusters(link_infos)
-    if len(clusters) <= 1:
+    if not clusters:
         return None
 
     links_by_index = {link.index: link for link in link_infos}
@@ -691,18 +1035,10 @@ def _japanese_tls_phases(link_infos: list[TLSLinkInfo], state_length: int) -> li
             for index in valid_active_indices
             if links_by_index[index].has_right_turn
         }
-        through_indices = {
-            index
-            for index in valid_active_indices
-            if links_by_index[index].has_non_right_turn
-        }
-        phases.append((green_time, _phase_state(state_length, valid_active_indices, right_turn_indices)))
+        permissive_indices = right_turn_indices | _shared_target_lane_indices(valid_active_indices, links_by_index)
+        phases.append((green_time, _phase_state(state_length, valid_active_indices, permissive_indices)))
         phases.append((JP_TLS_YELLOW_TIME_S, _phase_state(state_length, valid_active_indices).replace("G", "y")))
         phases.append((JP_TLS_ALL_RED_TIME_S, all_red))
-        if right_turn_indices and through_indices:
-            phases.append((JP_TLS_RIGHT_TURN_TIME_S, _phase_state(state_length, right_turn_indices)))
-            phases.append((JP_TLS_YELLOW_TIME_S, _phase_state(state_length, right_turn_indices).replace("G", "y")))
-            phases.append((JP_TLS_ALL_RED_TIME_S, all_red))
 
     return phases or None
 
@@ -711,11 +1047,13 @@ def _patch_net_japanese_tls_phases(net_path: str | Path) -> dict[str, object]:
     tree = ET.parse(path)
     root = tree.getroot()
     link_infos_by_tls = _tls_link_infos(root)
+    tl_logic_elements = root.findall("tlLogic")
+    before_audit = _tls_phase_sync_audit(tl_logic_elements, link_infos_by_tls)
     patched_tls_ids: list[str] = []
     skipped_single_axis_tls_ids: list[str] = []
     max_phase_count = 0
 
-    for tl_logic_element in root.findall("tlLogic"):
+    for tl_logic_element in tl_logic_elements:
         tl_id = tl_logic_element.attrib.get("id")
         if tl_id is None:
             continue
@@ -745,6 +1083,7 @@ def _patch_net_japanese_tls_phases(net_path: str | Path) -> dict[str, object]:
         patched_tls_ids.append(tl_id)
         max_phase_count = max(max_phase_count, len(phases))
 
+    after_audit = _tls_phase_sync_audit(tl_logic_elements, link_infos_by_tls)
     if patched_tls_ids:
         ET.indent(tree, space="  ")
         tree.write(path, encoding="utf-8", xml_declaration=True)
@@ -752,8 +1091,15 @@ def _patch_net_japanese_tls_phases(net_path: str | Path) -> dict[str, object]:
     return {
         "patched_tls_count": len(patched_tls_ids),
         "patched_tls_ids": patched_tls_ids,
+        "approach_synchronized_tls_count": len(patched_tls_ids),
         "skipped_single_axis_tls_count": len(skipped_single_axis_tls_ids),
         "max_phase_count": max_phase_count,
+        "mixed_same_incoming_lane_phase_count_before": before_audit["mixed_same_incoming_lane_phase_count"],
+        "mixed_same_incoming_lane_phase_count_after": after_audit["mixed_same_incoming_lane_phase_count"],
+        "mixed_same_approach_phase_count_before": before_audit["mixed_same_approach_phase_count"],
+        "mixed_same_approach_phase_count_after": after_audit["mixed_same_approach_phase_count"],
+        "phase_sync_examples_before": before_audit["examples"],
+        "phase_sync_examples_after": after_audit["examples"],
     }
 
 def _is_normal_net_edge(edge_element: ET.Element) -> bool:
