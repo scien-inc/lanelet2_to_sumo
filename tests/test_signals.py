@@ -223,6 +223,47 @@ class VehicleSignalPlanningTest(unittest.TestCase):
         self.assertAlmostEqual(_lanelet_path_signal_stop_offset_m(("a",), lanelet_map, road_lanelets), 7.0)
         self.assertEqual(unmapped, [])
 
+    def test_vehicle_signal_without_reachable_intersection_uses_standalone_tls(self) -> None:
+        road_lanelets = {
+            "a": make_lanelet("a", regulatory_ids=("r1",)),
+        }
+        lanelet_map = LaneletMap(
+            nodes={
+                "n2": Point3D(0.0, -1.0, 0.0),
+                "n3": Point3D(0.0, 1.0, 0.0),
+            },
+            ways={
+                "refers": Way(id="refers", node_ids=("n0", "n1"), tags={"subtype": "red_yellow_green"}),
+                "ref_line": Way(id="ref_line", node_ids=("n2", "n3"), tags={"subtype": "stop_line"}),
+            },
+            lanelets=road_lanelets,
+            regulatory_elements={
+                "r1": RegulatoryElement(
+                    id="r1",
+                    subtype="traffic_light",
+                    tags={"subtype": "traffic_light"},
+                    members_by_role={"refers": ("refers",), "ref_line": ("ref_line",)},
+                )
+            },
+        )
+
+        tls_ids_by_node_id, signal_summary, unmapped, mapping_records = _plan_vehicle_signals(
+            lanelet_map,
+            road_lanelets,
+            {},
+            {},
+            {"group_a:start": "node_tls"},
+            {"a": "group_a"},
+        )
+
+        self.assertEqual(tls_ids_by_node_id, {"node_tls": "tls_signal_r1"})
+        self.assertEqual(unmapped, [])
+        self.assertEqual(signal_summary["unmapped_relation_count"], 0)
+        self.assertEqual(mapping_records[0]["planned_sumo_tls_id"], "tls_signal_r1")
+        self.assertEqual(mapping_records[0]["planned_sumo_node_ids"], ["node_tls"])
+        self.assertEqual(mapping_records[0]["resolution_status"], "planned_only")
+        self.assertEqual(mapping_records[0]["reason"], "standalone_signal_no_reachable_intersection_area")
+
     def test_signalized_intersection_areas_are_not_collapsed(self) -> None:
         road_lanelets = {
             "a": make_lanelet("a", regulatory_ids=("r1",)),
