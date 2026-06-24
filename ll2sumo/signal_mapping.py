@@ -49,10 +49,12 @@ def _signal_mapping_record(
     intersection_area_id: str | None,
     planned_sumo_tls_id: str | None,
     planned_sumo_node_ids: Iterable[str] = (),
+    candidate_intersection_area_ids: Iterable[str] = (),
     resolution_status: str,
     reason: str | None = None,
 ) -> SignalMappingRecord:
     sorted_relation_ids = tuple(sorted(relation_ids, key=_sort_key))
+    sorted_candidate_area_ids = tuple(sorted(candidate_intersection_area_ids, key=_sort_key))
     record: SignalMappingRecord = {
         "lanelet_regulatory_element_ids": list(sorted_relation_ids),
         "lanelet_traffic_light_way_ids": list(
@@ -63,6 +65,7 @@ def _signal_mapping_record(
         ),
         "attached_lanelet_ids": list(sorted(attached_lanelet_ids, key=_sort_key)),
         "intersection_area_id": intersection_area_id,
+        "candidate_intersection_area_ids": list(sorted_candidate_area_ids),
         "planned_sumo_tls_id": planned_sumo_tls_id,
         "planned_sumo_node_ids": list(sorted(planned_sumo_node_ids, key=_sort_key)),
         "actual_sumo_tls_ids": [],
@@ -119,9 +122,33 @@ def _net_internal_lane_to_junction_id(root: ET.Element) -> dict[str, str]:
     return lane_to_junction
 
 
+def _tls_ids_from_attached_lanelets(
+    connections: list[ET.Element],
+    tls_ids: set[str],
+    lanelet_paths_by_lane_key: dict[tuple[str, str], tuple[str, ...]],
+    attached_lanelet_ids: set[str],
+) -> set[str]:
+    if not attached_lanelet_ids:
+        return set()
+    lane_keys = {
+        lane_key
+        for lane_key, lanelet_path in lanelet_paths_by_lane_key.items()
+        if attached_lanelet_ids.intersection(lanelet_path)
+    }
+    if not lane_keys:
+        return set()
+    return {
+        connection.attrib["tl"]
+        for connection in connections
+        if (connection.attrib.get("from", ""), connection.attrib.get("fromLane", "")) in lane_keys
+        and connection.attrib.get("tl") in tls_ids
+    }
+
+
 def _resolve_signal_mapping_records(
     records: list[SignalMappingRecord],
     net_path: str | Path | None,
+    lanelet_paths_by_lane_key: dict[tuple[str, str], tuple[str, ...]] | None = None,
 ) -> list[SignalMappingRecord]:
     if net_path is None:
         return [dict(record) for record in records]
@@ -134,20 +161,24 @@ def _resolve_signal_mapping_records(
     connections = root.findall("connection")
     internal_lane_to_junction_id = _net_internal_lane_to_junction_id(root)
     resolved_records: list[SignalMappingRecord] = []
+    lanelet_paths_by_lane_key = lanelet_paths_by_lane_key or {}
 
     for record in records:
         resolved = dict(record)
-        if resolved.get("resolution_status") == "unmapped":
+        if resolved.get("resolution_status") in {"unmapped", "excluded_non_vehicle"}:
             resolved_records.append(resolved)
             continue
 
+        area_ids = set(_record_string_list(resolved, "candidate_intersection_area_ids"))
         intersection_area_id = resolved.get("intersection_area_id")
+        if intersection_area_id:
+            area_ids.add(str(intersection_area_id))
         planned_node_ids = _record_string_list(resolved, "planned_sumo_node_ids")
         planned_tls_id = resolved.get("planned_sumo_tls_id")
         actual_tls_ids: set[str] = set()
 
-        if intersection_area_id:
-            via_prefix = f":ia_{intersection_area_id}_"
+        for area_id in sorted(area_ids, key=_sort_key):
+            via_prefix = f":ia_{area_id}_"
             actual_tls_ids.update(
                 connection.attrib["tl"]
                 for connection in connections
@@ -166,6 +197,16 @@ def _resolve_signal_mapping_records(
 
         if isinstance(planned_tls_id, str) and planned_tls_id in tls_ids:
             actual_tls_ids.add(planned_tls_id)
+
+        if not actual_tls_ids:
+            actual_tls_ids.update(
+                _tls_ids_from_attached_lanelets(
+                    connections,
+                    tls_ids,
+                    lanelet_paths_by_lane_key,
+                    set(_record_string_list(resolved, "attached_lanelet_ids")),
+                )
+            )
 
         sorted_actual_tls_ids = sorted(actual_tls_ids, key=_sort_key)
         if not sorted_actual_tls_ids:
@@ -194,6 +235,48 @@ def _resolve_signal_mapping_records(
         resolved["resolution_status"] = "mapped"
         resolved.pop("reason", None)
         resolved_records.append(resolved)
+
+    mapped_by_refers: dict[str, list[SignalMappingRecord]] = defaultdict(list)
+    for record in resolved_records:
+        if record.get("resolution_status") != "mapped":
+            continue
+        for way_id in _record_string_list(record, "lanelet_traffic_light_way_ids"):
+            mapped_by_refers[way_id].append(record)
+
+    for record in resolved_records:
+        if record.get("resolution_status") != "unmapped":
+            continue
+        fallback_records = {
+            id(fallback_record): fallback_record
+            for way_id in _record_string_list(record, "lanelet_traffic_light_way_ids")
+            for fallback_record in mapped_by_refers.get(way_id, [])
+        }
+        if not fallback_records:
+            continue
+        actual_tls_ids = {
+            tls_id
+            for fallback_record in fallback_records.values()
+            for tls_id in _record_string_list(fallback_record, "actual_sumo_tls_ids")
+        }
+        if not actual_tls_ids:
+            continue
+        actual_connections = [
+            connection
+            for connection in connections
+            if connection.attrib.get("tl") in actual_tls_ids
+        ]
+        actual_junction_ids = {
+            junction_id
+            for connection in actual_connections
+            for junction_id in [internal_lane_to_junction_id.get(connection.attrib.get("via", ""))]
+            if junction_id is not None
+        }
+        record["actual_sumo_tls_ids"] = sorted(actual_tls_ids, key=_sort_key)
+        record["actual_sumo_junction_ids"] = sorted(actual_junction_ids, key=_sort_key)
+        record["actual_sumo_connection_count"] = len(actual_connections)
+        record["resolution_status"] = "mapped"
+        record["resolution_method"] = "same_refers_fallback"
+        record.pop("reason", None)
 
     return sorted(resolved_records, key=_signal_mapping_record_sort_key)
 
@@ -542,6 +625,7 @@ def _signal_mapping_summary(
         "mapped_record_count": status_counts.get("mapped", 0),
         "unmapped_record_count": status_counts.get("unmapped", 0),
         "planned_only_record_count": status_counts.get("planned_only", 0),
+        "excluded_non_vehicle_record_count": status_counts.get("excluded_non_vehicle", 0),
         "actual_sumo_tls_count": len(sumo_to_lanelet),
         "lanelet_regulatory_element_count": len(regulatory_element_ids),
         "lanelet_traffic_light_way_count": len(traffic_light_way_ids),
