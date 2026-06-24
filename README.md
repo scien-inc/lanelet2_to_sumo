@@ -127,8 +127,8 @@ out/example-network/
 It contains both group-level Lanelet2 signal mappings and SUMO connection-level mappings:
 
 - `lanelet_to_sumo`: Lanelet2 traffic-light regulatory elements and `refers` / `ref_line` way IDs mapped to the final SUMO `<tlLogic id>`.
-- `sumo_link_to_lanelet_signal`: final SUMO `tlLogic id + linkIndex` records mapped back to Lanelet2 `refers` way IDs for runtime signal synchronization.
-- `lanelet_signal_to_sumo_links`: reverse lookup keyed by Lanelet2 `refers` way ID.
+- `sumo_link_to_lanelet_signal`: final SUMO `tlLogic id + linkIndex` records mapped back to Lanelet2 `refers` way IDs, including diagnostic fallback candidates.
+- `lanelet_signal_to_sumo_links`: runtime synchronization lookup keyed by Lanelet2 `refers` way ID. It contains direct source-lanelet matches only; fallback candidates stay in `sumo_link_to_lanelet_signal` for diagnostics.
 
 Open the generated network in SUMO GUI on the host:
 

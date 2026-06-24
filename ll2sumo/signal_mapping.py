@@ -513,9 +513,9 @@ def _annotate_link_records_for_signal_sync(
                 if pattern == primary_pattern:
                     if record.get("match_status") == "matched":
                         status = "primary_matched"
+                        eligible_way_ids.append(way_id)
                     else:
-                        status = "primary_fallback"
-                    eligible_way_ids.append(way_id)
+                        status = "diagnostic_fallback"
                 elif record.get("match_status") == "matched":
                     status = "conflicting_timing"
                 else:

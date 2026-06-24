@@ -573,9 +573,9 @@ class VehicleSignalPlanningTest(unittest.TestCase):
 
             self.assertEqual(link_records[0]["match_status"], "tls_group_fallback")
             self.assertEqual(summary["fallback_sumo_link_count"], 1)
-            self.assertEqual(document["lanelet_signal_to_sumo_links"]["signal_way_a"][0]["match_status"], "tls_group_fallback")
-            self.assertEqual(document["lanelet_signal_to_sumo_links"]["signal_way_a"][0]["sync_status"], "primary_fallback")
-            self.assertTrue(document["sumo_link_to_lanelet_signal"][0]["sync_eligible"])
+            self.assertNotIn("signal_way_a", document["lanelet_signal_to_sumo_links"])
+            self.assertEqual(document["sumo_link_to_lanelet_signal"][0]["sync_status"], "diagnostic_fallback")
+            self.assertFalse(document["sumo_link_to_lanelet_signal"][0]["sync_eligible"])
 
     def test_signal_link_mapping_indexes_by_refers_way_and_audits_phase_mixing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -741,15 +741,15 @@ class VehicleSignalPlanningTest(unittest.TestCase):
             document = json.loads(mapping_path.read_text(encoding="utf-8"))
 
             self.assertEqual(summary["mixed_lanelet_signal_phase_count"], 0)
-            self.assertEqual(summary["sync_eligible_sumo_link_count"], 2)
+            self.assertEqual(summary["sync_eligible_sumo_link_count"], 1)
             self.assertEqual(
                 [entry["match_status"] for entry in document["lanelet_signal_to_sumo_links"]["signal_way_a"]],
                 ["matched"],
             )
-            self.assertEqual(
-                [entry["match_status"] for entry in document["lanelet_signal_to_sumo_links"]["signal_way_b"]],
-                ["tls_group_fallback"],
-            )
+            self.assertNotIn("signal_way_b", document["lanelet_signal_to_sumo_links"])
+            self.assertEqual(document["sumo_link_to_lanelet_signal"][1]["match_status"], "tls_group_fallback")
+            self.assertEqual(document["sumo_link_to_lanelet_signal"][1]["sync_status"], "diagnostic_fallback")
+            self.assertFalse(document["sumo_link_to_lanelet_signal"][1]["sync_eligible"])
 
     def test_signal_link_mapping_does_not_conflict_on_protected_and_permissive_green(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
