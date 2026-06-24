@@ -102,6 +102,49 @@ def _load_mapping(mapping_path: Path) -> dict[str, Any]:
         return json.load(handle)
 
 
+def _vehicle_signal_way_info(mapping: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Return Lanelet2 vehicle traffic_light way IDs that should be drawn."""
+    info: dict[str, dict[str, Any]] = {}
+    for record in mapping.get("lanelet_to_sumo", []):
+        if not isinstance(record, dict):
+            continue
+        if record.get("resolution_status") == "excluded_non_vehicle":
+            continue
+        way_ids = [str(way_id) for way_id in record.get("lanelet_traffic_light_way_ids", [])]
+        for way_id in way_ids:
+            way_info = info.setdefault(
+                way_id,
+                {
+                    "regulatory_element_ids": set(),
+                    "intersection_area_ids": set(),
+                    "planned_sumo_tls_ids": set(),
+                    "actual_sumo_tls_ids": set(),
+                    "resolution_statuses": Counter(),
+                },
+            )
+            way_info["regulatory_element_ids"].update(str(item) for item in record.get("lanelet_regulatory_element_ids", []))
+            if record.get("intersection_area_id"):
+                way_info["intersection_area_ids"].add(str(record["intersection_area_id"]))
+            if record.get("planned_sumo_tls_id"):
+                way_info["planned_sumo_tls_ids"].add(str(record["planned_sumo_tls_id"]))
+            way_info["actual_sumo_tls_ids"].update(str(item) for item in record.get("actual_sumo_tls_ids", []))
+            way_info["resolution_statuses"][str(record.get("resolution_status", "unknown"))] += 1
+    return info
+
+
+def _direct_matched_links_by_way(mapping: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """Return only direct SUMO link matches, intentionally excluding fallback records."""
+    links_by_way: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in mapping.get("sumo_link_to_lanelet_signal", []):
+        if not isinstance(record, dict):
+            continue
+        if record.get("match_status") != "matched":
+            continue
+        for way_id in record.get("lanelet_traffic_light_way_ids", []):
+            links_by_way[str(way_id)].append(record)
+    return links_by_way
+
+
 def _screen_point(point: Point3D, max_y: float) -> dict[str, float]:
     return {"x": round(point.x, 3), "y": round(max_y - point.y, 3)}
 
@@ -186,11 +229,12 @@ def _build_payload(osm_path: Path, mapping_path: Path, net_path: Path) -> tuple[
     lanelet_map = parse_lanelet_map(osm_path)
     mapping = _load_mapping(mapping_path)
     tl_logics = _load_tl_logics(net_path)
-    reverse_mapping = mapping.get("lanelet_signal_to_sumo_links", {})
-    if not isinstance(reverse_mapping, dict):
-        raise ValueError("signal_id_mapping.json does not contain lanelet_signal_to_sumo_links")
+    way_info = _vehicle_signal_way_info(mapping)
+    direct_links_by_way = _direct_matched_links_by_way(mapping)
+    if not way_info:
+        raise ValueError("signal_id_mapping.json does not contain vehicle Lanelet2 signal ways")
 
-    used_way_ids = {str(way_id) for way_id in reverse_mapping}
+    used_way_ids = set(way_info)
     road_points: list[Point3D] = []
     for lanelet in lanelet_map.lanelets.values():
         if lanelet.subtype == "road":
@@ -227,35 +271,40 @@ def _build_payload(osm_path: Path, mapping_path: Path, net_path: Path) -> tuple[
         road_paths.append([_screen_point(point, max_y) for point in lanelet.centerline])
 
     signals: list[dict[str, Any]] = []
-    for way_id, links in sorted(reverse_mapping.items(), key=lambda item: _sort_key(str(item[0]))):
-        if not isinstance(links, list):
-            continue
+    unmapped_way_count = 0
+    for way_id, info in sorted(way_info.items(), key=lambda item: _sort_key(str(item[0]))):
         points = signal_way_points.get(str(way_id))
         if not points:
             continue
         midpoint = _polyline_midpoint(points)
         if midpoint is None:
             continue
-        typed_links = [link for link in links if isinstance(link, dict)]
+        typed_links = [link for link in direct_links_by_way.get(str(way_id), []) if isinstance(link, dict)]
         reg_ids = sorted(
-            {str(reg_id) for link in typed_links for reg_id in link.get("lanelet_regulatory_element_ids", [])},
+            set(info["regulatory_element_ids"])
+            | {str(reg_id) for link in typed_links for reg_id in link.get("lanelet_regulatory_element_ids", [])},
             key=_sort_key,
         )
         intersections = sorted(
-            {str(link["intersection_area_id"]) for link in typed_links if link.get("intersection_area_id")},
+            set(info["intersection_area_ids"])
+            | {str(link["intersection_area_id"]) for link in typed_links if link.get("intersection_area_id")},
             key=_sort_key,
         )
         phase_groups = _build_signal_phase_groups(typed_links, tl_logics)
-        if not phase_groups:
-            warnings.append(f"No usable SUMO phase group for Lanelet2 traffic_light way: {way_id}")
-            continue
+        has_direct_match = bool(phase_groups)
+        if not has_direct_match:
+            unmapped_way_count += 1
         signals.append(
             {
                 "wayId": str(way_id),
                 "position": _screen_point(midpoint, max_y),
                 "line": [_screen_point(point, max_y) for point in points],
+                "hasDirectMatch": has_direct_match,
                 "regulatoryElementIds": reg_ids,
                 "intersectionAreaIds": intersections,
+                "plannedSumoTlsIds": sorted(info["planned_sumo_tls_ids"]),
+                "actualSumoTlsIds": sorted(info["actual_sumo_tls_ids"]),
+                "resolutionStatuses": dict(info["resolution_statuses"]),
                 "linkCount": len(typed_links),
                 "phaseGroups": phase_groups,
             }
@@ -275,8 +324,11 @@ def _build_payload(osm_path: Path, mapping_path: Path, net_path: Path) -> tuple[
             "schemaVersion": mapping.get("schema_version"),
             "summary": mapping.get("summary", {}),
             "signalCount": len(signals),
+            "directMatchedSignalCount": len(signals) - unmapped_way_count,
+            "unmappedSignalCount": unmapped_way_count,
             "tlsCount": len({group["tlsId"] for signal in signals for group in signal["phaseGroups"]}),
             "roadPathCount": len(road_paths),
+            "visualizationMode": "direct_matched_only",
         },
         "viewport": viewport,
         "roadPaths": road_paths,
@@ -309,6 +361,7 @@ def _html_document(payload: dict[str, Any], warnings: list[str]) -> str:
       --green: #14a553;
       --off: #8f98a4;
       --unknown: #6b4cb3;
+      --missing: #111827;
     }}
     * {{ box-sizing: border-box; }}
     body {{
@@ -383,21 +436,66 @@ def _html_document(payload: dict[str, Any], warnings: list[str]) -> str:
       stroke-linecap: round;
       vector-effect: non-scaling-stroke;
     }}
-    .signal {{
+    #markerLayer {{
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+    }}
+    .signal-marker {{
+      position: absolute;
+      width: 6px;
+      height: 6px;
+      min-width: 0;
+      padding: 0;
+      border: 1px solid rgba(17, 24, 39, 0.72);
+      border-radius: 999px;
+      appearance: none;
       cursor: pointer;
-      stroke: #1f2328;
-      stroke-width: 1.8;
-      vector-effect: non-scaling-stroke;
+      font-size: 0;
+      pointer-events: auto;
+      transform: translate(-50%, -50%);
+      box-shadow: none;
     }}
-    .signal.selected {{
-      stroke-width: 4.0;
-      stroke: #111827;
+    .signal-marker.selected {{
+      width: 12px;
+      height: 12px;
+      border: 2px solid #111827;
+      outline: 2px solid rgba(17, 24, 39, 0.35);
+      outline-offset: 1px;
+      z-index: 4;
     }}
-    .state-red {{ fill: var(--red); }}
-    .state-yellow {{ fill: var(--yellow); }}
-    .state-green {{ fill: var(--green); }}
-    .state-off {{ fill: var(--off); }}
-    .state-unknown {{ fill: var(--unknown); }}
+    .signal-marker.missing {{
+      width: 10px;
+      height: 10px;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      box-shadow: none;
+    }}
+    .signal-marker.missing::before,
+    .signal-marker.missing::after {{
+      content: "";
+      position: absolute;
+      left: 4px;
+      top: -1px;
+      width: 2px;
+      height: 12px;
+      border-radius: 999px;
+      background: var(--missing);
+    }}
+    .signal-marker.missing::before {{ transform: rotate(45deg); }}
+    .signal-marker.missing::after {{ transform: rotate(-45deg); }}
+    .signal-marker.state-red {{ background: var(--red); }}
+    .signal-marker.state-yellow {{ background: var(--yellow); }}
+    .signal-marker.state-green {{ background: var(--green); }}
+    .signal-marker.state-off {{ background: var(--off); }}
+    .signal-marker.state-unknown {{ background: var(--unknown); }}
+    .signal-marker.state-missing {{ background: transparent; }}
+    .signal-marker[data-density="dense"] {{
+      width: 5px;
+      height: 5px;
+      border-width: 1px;
+    }}
     aside {{
       border-left: 1px solid var(--border);
       background: var(--panel);
@@ -488,6 +586,7 @@ def _html_document(payload: dict[str, Any], warnings: list[str]) -> str:
   <main>
     <div id="mapWrap">
       <svg id="map" aria-label="Lanelet2 signal timing map"></svg>
+      <div id="markerLayer" aria-label="Lanelet2 signal markers"></div>
     </div>
     <aside>
       <section>
@@ -498,8 +597,9 @@ def _html_document(payload: dict[str, Any], warnings: list[str]) -> str:
           <span class="chip"><span class="dot" style="background:var(--yellow)"></span>yellow</span>
           <span class="chip"><span class="dot" style="background:var(--green)"></span>green</span>
           <span class="chip"><span class="dot" style="background:var(--off)"></span>off</span>
+          <span class="chip"><span style="color:var(--missing);font-weight:800">×</span>no direct match</span>
         </div>
-        <p class="hint">Signals are placed from Lanelet2 <code>traffic_light/refers</code> way geometry. Colors are computed from SUMO <code>tlLogic id + linkIndex</code> via the sync-safe mapping.</p>
+        <p class="hint">Signals are placed from Lanelet2 <code>traffic_light/refers</code> way geometry. Colors use only direct SUMO link matches. Fallback mappings are intentionally excluded; signals without a direct matched SUMO link are shown as <strong>×</strong>.</p>
       </section>
       <section class="detail">
         <h2>Selected Signal</h2>
@@ -511,8 +611,8 @@ def _html_document(payload: dict[str, Any], warnings: list[str]) -> str:
   <script>
     const payload = {payload_text};
     const warnings = {warnings_text};
-    const priority = {{off: 0, green: 1, yellow: 2, red: 3, unknown: 4}};
-    const cssClass = {{red: "state-red", yellow: "state-yellow", green: "state-green", off: "state-off", unknown: "state-unknown"}};
+    const priority = {{off: 0, green: 1, yellow: 2, red: 3, unknown: 4, missing: 5}};
+    const cssClass = {{red: "state-red", yellow: "state-yellow", green: "state-green", off: "state-off", unknown: "state-unknown", missing: "state-missing"}};
     let playing = true;
     let simTime = 0;
     let lastFrame = performance.now();
@@ -527,6 +627,7 @@ def _html_document(payload: dict[str, Any], warnings: list[str]) -> str:
     const timeSlider = document.getElementById("timeSlider");
     const timeLabel = document.getElementById("timeLabel");
     const warningsBox = document.getElementById("warnings");
+    const markerLayer = document.getElementById("markerLayer");
 
     const maxCycle = Math.max(1, ...payload.signals.flatMap(signal => signal.phaseGroups.map(group => group.cycle || 0)));
     timeSlider.max = String(maxCycle);
@@ -550,8 +651,34 @@ def _html_document(payload: dict[str, Any], warnings: list[str]) -> str:
     }}
 
     function signalState(signal, t) {{
+      if (!signal.hasDirectMatch) return "missing";
       const states = signal.phaseGroups.map(group => stateAt(group, t));
       return states.reduce((best, state) => priority[state] > priority[best] ? state : best, "off");
+    }}
+
+    function projectToMarkerLayer(point) {{
+      const svgPoint = svg.createSVGPoint();
+      svgPoint.x = point.x;
+      svgPoint.y = point.y;
+      const ctm = svg.getScreenCTM();
+      if (!ctm) return {{x: 0, y: 0}};
+      const screenPoint = svgPoint.matrixTransform(ctm);
+      const layerRect = markerLayer.getBoundingClientRect();
+      return {{
+        x: screenPoint.x - layerRect.left,
+        y: screenPoint.y - layerRect.top,
+      }};
+    }}
+
+    function positionMarkers() {{
+      for (const marker of markerLayer.querySelectorAll(".signal-marker")) {{
+        const wayId = marker.getAttribute("data-way-id");
+        const signal = payload.signals.find(item => item.wayId === wayId);
+        if (!signal) continue;
+        const point = projectToMarkerLayer(signal.position);
+        marker.style.left = `${{point.x}}px`;
+        marker.style.top = `${{point.y}}px`;
+      }}
     }}
 
     function renderMap() {{
@@ -576,28 +703,29 @@ def _html_document(payload: dict[str, Any], warnings: list[str]) -> str:
       }}
       svg.appendChild(lineGroup);
 
-      const signalGroup = document.createElementNS("http://www.w3.org/2000/svg", "g");
+      markerLayer.innerHTML = "";
       for (const signal of payload.signals) {{
-        const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-        circle.setAttribute("class", "signal state-unknown");
-        circle.setAttribute("data-way-id", signal.wayId);
-        circle.setAttribute("cx", signal.position.x);
-        circle.setAttribute("cy", signal.position.y);
-        circle.setAttribute("r", 7);
-        const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
-        title.textContent = `Lanelet2 signal way ${{signal.wayId}}`;
-        circle.appendChild(title);
-        circle.addEventListener("click", () => {{
+        const marker = document.createElement("button");
+        marker.type = "button";
+        marker.className = signal.hasDirectMatch ? "signal-marker state-unknown" : "signal-marker state-missing missing";
+        marker.dataset.wayId = signal.wayId;
+        marker.title = `Lanelet2 signal way ${{signal.wayId}}`;
+        marker.setAttribute("aria-label", `Lanelet2 signal way ${{signal.wayId}}`);
+        marker.addEventListener("click", () => {{
           selectedWayId = signal.wayId;
           update(simTime);
         }});
-        signalGroup.appendChild(circle);
+        markerLayer.appendChild(marker);
       }}
-      svg.appendChild(signalGroup);
+      positionMarkers();
     }}
 
     function setClass(element, state, selected) {{
-      element.setAttribute("class", `signal ${{cssClass[state] || cssClass.unknown}}${{selected ? " selected" : ""}}`);
+      const missing = state === "missing";
+      element.setAttribute(
+        "class",
+        `signal-marker ${{cssClass[state] || cssClass.unknown}}${{missing ? " missing" : ""}}${{selected ? " selected" : ""}}`
+      );
     }}
 
     function renderSummary() {{
@@ -605,11 +733,13 @@ def _html_document(payload: dict[str, Any], warnings: list[str]) -> str:
       const s = meta.summary || {{}};
       const rows = [
         ["Lanelet2 signal ways", meta.signalCount],
+        ["direct matched ways", meta.directMatchedSignalCount],
+        ["no direct match", meta.unmappedSignalCount],
         ["SUMO TLS groups", meta.tlsCount],
         ["road centerlines", meta.roadPathCount],
         ["mixed sync count", s.mixed_lanelet_signal_phase_count ?? "-"],
         ["diagnostic mixed count", s.diagnostic_mixed_lanelet_signal_phase_count ?? "-"],
-        ["sync link count", s.sync_eligible_sumo_link_count ?? "-"],
+        ["visualization mode", meta.visualizationMode],
       ];
       summary.innerHTML = rows.map(([k, v]) => `<div class="stat"><span>${{escapeText(k)}}</span><strong>${{escapeText(v)}}</strong></div>`).join("");
       if (warnings.length) {{
@@ -638,28 +768,31 @@ def _html_document(payload: dict[str, Any], warnings: list[str]) -> str:
         <div class="stat"><span>Lanelet2 refers way</span><code>${{escapeText(signal.wayId)}}</code></div>
         <div class="stat"><span>regulatory elements</span><code>${{escapeText(signal.regulatoryElementIds.join(", ") || "-")}}</code></div>
         <div class="stat"><span>intersection areas</span><code>${{escapeText(signal.intersectionAreaIds.join(", ") || "-")}}</code></div>
-        <div class="stat"><span>sync links</span><strong>${{escapeText(signal.linkCount)}}</strong></div>
-        <h3>SUMO TLS</h3>
-        ${{signal.phaseGroups.map(group => `
+        <div class="stat"><span>direct matched links</span><strong>${{escapeText(signal.linkCount)}}</strong></div>
+        <div class="stat"><span>planned SUMO TLS</span><code>${{escapeText(signal.plannedSumoTlsIds.join(", ") || "-")}}</code></div>
+        <div class="stat"><span>actual SUMO TLS</span><code>${{escapeText(signal.actualSumoTlsIds.join(", ") || "-")}}</code></div>
+        <div class="stat"><span>group status</span><code>${{escapeText(Object.entries(signal.resolutionStatuses).map(([k, v]) => `${{k}}:${{v}}`).join(", ") || "-")}}</code></div>
+        <h3>Direct Matched SUMO TLS</h3>
+        ${{signal.hasDirectMatch ? signal.phaseGroups.map(group => `
           <div>
             <code>${{escapeText(group.tlsId)}}</code>
             <div class="small">cycle ${{escapeText(group.cycle)}}s / linkIndex ${{escapeText(group.linkIndices.join(", "))}}</div>
             ${{renderPhaseBar(group)}}
           </div>
-        `).join("")}}
+        `).join("") : `<p class="hint">No direct matched SUMO link. This signal may only be covered by fallback mapping, so it is not colored in this view.</p>`}}
       `;
     }}
 
     function update(t) {{
-      const circles = svg.querySelectorAll(".signal");
+      const markers = markerLayer.querySelectorAll(".signal-marker");
       let selectedSignal = null;
       let selectedState = "unknown";
-      for (const circle of circles) {{
-        const wayId = circle.getAttribute("data-way-id");
+      for (const marker of markers) {{
+        const wayId = marker.getAttribute("data-way-id");
         const signal = payload.signals.find(item => item.wayId === wayId);
         const state = signalState(signal, t);
         const selected = wayId === selectedWayId;
-        setClass(circle, state, selected);
+        setClass(marker, state, selected);
         if (selected) {{
           selectedSignal = signal;
           selectedState = state;
@@ -680,6 +813,7 @@ def _html_document(payload: dict[str, Any], warnings: list[str]) -> str:
     speed.addEventListener("input", () => {{
       speedLabel.textContent = `${{Number(speed.value).toFixed(1)}}x`;
     }});
+    window.addEventListener("resize", positionMarkers);
     timeSlider.addEventListener("input", () => {{
       simTime = Number(timeSlider.value);
       playing = false;
@@ -714,6 +848,8 @@ def render_html(osm_path: Path, mapping_path: Path, net_path: Path, html_path: P
     return {
         "html_path": str(html_path),
         "lanelet_signal_way_count": payload["meta"]["signalCount"],
+        "direct_matched_signal_way_count": payload["meta"]["directMatchedSignalCount"],
+        "no_direct_match_signal_way_count": payload["meta"]["unmappedSignalCount"],
         "displayed_tls_count": payload["meta"]["tlsCount"],
         "road_path_count": payload["meta"]["roadPathCount"],
         "warning_count": len(warnings),
