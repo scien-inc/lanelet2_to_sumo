@@ -27,6 +27,16 @@ from ll2sumo import net_postprocess
 from ll2sumo.lane_change import analyze_lane_changes, blocked_change_permissions
 from ll2sumo.model import GeoReference, Lanelet, LaneletMap, Point3D, RegulatoryElement
 from ll2sumo.parser import parse_lanelet_map
+from ll2sumo.signal_mapping import (
+    SignalMappingRecord,
+    _build_sumo_link_signal_mapping_records,
+    _extend_lanelet_paths_to_intersection_entry,
+    _lanelet_paths_by_sumo_lane_key,
+    _resolve_signal_mapping_records,
+    _signal_mapping_record,
+    _signal_mapping_record_sort_key,
+    _write_signal_id_mapping_json,
+)
 from ll2sumo.sumo_xml import (
     id_sort_key as _sort_key,
     shape_string as _shape_string,
@@ -1870,7 +1880,7 @@ def _plan_vehicle_signals(
     intersection_clusters: dict[str, IntersectionCluster],
     node_ids: dict[str, str],
     lanelet_to_group: dict[str, str],
-) -> tuple[dict[str, str], dict[str, int], list[dict[str, object]]]:
+) -> tuple[dict[str, str], dict[str, int], list[dict[str, object]], list[SignalMappingRecord]]:
     traffic_light_regs = _traffic_light_regulatory_elements(lanelet_map)
     lanelets_by_regulatory_element = _lanelets_by_regulatory_element(lanelet_map)
 
@@ -1889,7 +1899,33 @@ def _plan_vehicle_signals(
     unmapped_signals: list[dict[str, object]] = []
     inferred_no_refline_count = 0
     mapped_relation_ids: set[str] = set()
+    excluded_relation_ids: set[str] = set()
     tls_ids_by_node_id: dict[str, str] = {}
+    signal_mapping_records: list[SignalMappingRecord] = []
+
+    def candidate_stopline_node_ids(
+        relation_ids: Iterable[str],
+        attached_road_lanelet_ids: Iterable[str],
+    ) -> set[str]:
+        candidate_node_ids: set[str] = set()
+        for relation_id in relation_ids:
+            regulatory_element = traffic_light_regs[relation_id]
+            relation_lanelet_ids = set(lanelets_by_regulatory_element.get(relation_id, ()))
+            for lanelet_id in attached_road_lanelet_ids:
+                if lanelet_id not in relation_lanelet_ids:
+                    continue
+                group_id = lanelet_to_group.get(lanelet_id)
+                if group_id is None:
+                    continue
+                endpoint = _traffic_light_stopline_endpoint(
+                    lanelet_map,
+                    road_lanelets[lanelet_id],
+                    regulatory_element,
+                )
+                stopline_node_key = f"{group_id}:{endpoint or 'end'}"
+                if stopline_node_key in node_ids:
+                    candidate_node_ids.add(node_ids[stopline_node_key])
+        return candidate_node_ids
 
     for control_key, relation_ids in sorted(
         control_buckets.items(),
@@ -1912,11 +1948,18 @@ def _plan_vehicle_signals(
         )
         attached_road_lanelet_ids = tuple(lanelet_id for lanelet_id in attached_lanelet_ids if lanelet_id in road_lanelets)
         if not attached_road_lanelet_ids:
-            unmapped_signals.append(
-                {
-                    "relation_ids": list(relation_ids),
-                    "reason": "no_attached_road_lanelets",
-                }
+            reason = "no_attached_road_lanelets"
+            excluded_relation_ids.update(relation_ids)
+            signal_mapping_records.append(
+                _signal_mapping_record(
+                    relation_ids=relation_ids,
+                    traffic_light_regs=traffic_light_regs,
+                    attached_lanelet_ids=attached_lanelet_ids,
+                    intersection_area_id=None,
+                    planned_sumo_tls_id=None,
+                    resolution_status="excluded_non_vehicle",
+                    reason=reason,
+                )
             )
             continue
 
@@ -1928,45 +1971,90 @@ def _plan_vehicle_signals(
                 continue
             reachable_area_ids.update(_reachable_intersection_area_signature((lanelet_id,), road_lanelets, successors))
 
-        if len(reachable_area_ids) != 1:
+        if not reachable_area_ids:
+            candidate_node_ids = candidate_stopline_node_ids(relation_ids, attached_road_lanelet_ids)
+            if candidate_node_ids:
+                tls_id = f"tls_signal_{sorted(relation_ids, key=_sort_key)[0]}"
+                for node_id in sorted(candidate_node_ids, key=_sort_key):
+                    tls_ids_by_node_id[node_id] = tls_id
+                mapped_relation_ids.update(relation_ids)
+                signal_mapping_records.append(
+                    _signal_mapping_record(
+                        relation_ids=relation_ids,
+                        traffic_light_regs=traffic_light_regs,
+                        attached_lanelet_ids=attached_lanelet_ids,
+                        intersection_area_id=None,
+                        planned_sumo_tls_id=tls_id,
+                        planned_sumo_node_ids=candidate_node_ids,
+                        resolution_status="planned_only",
+                        reason="standalone_signal_no_reachable_intersection_area",
+                    )
+                )
+                if not ref_line_way_ids:
+                    inferred_no_refline_count += 1
+                continue
+
+            reason = "no_reachable_intersection_area"
             unmapped_signals.append(
                 {
                     "relation_ids": list(relation_ids),
-                    "reason": "multiple_reachable_intersection_areas" if reachable_area_ids else "no_reachable_intersection_area",
+                    "reason": reason,
                 }
+            )
+            signal_mapping_records.append(
+                _signal_mapping_record(
+                    relation_ids=relation_ids,
+                    traffic_light_regs=traffic_light_regs,
+                    attached_lanelet_ids=attached_lanelet_ids,
+                    intersection_area_id=None,
+                    planned_sumo_tls_id=None,
+                    resolution_status="unmapped",
+                    reason=reason,
+                )
+            )
+            continue
+
+        if len(reachable_area_ids) != 1:
+            signal_mapping_records.append(
+                _signal_mapping_record(
+                    relation_ids=relation_ids,
+                    traffic_light_regs=traffic_light_regs,
+                    attached_lanelet_ids=attached_lanelet_ids,
+                    intersection_area_id=None,
+                    planned_sumo_tls_id=None,
+                    candidate_intersection_area_ids=reachable_area_ids,
+                    resolution_status="planned_only",
+                    reason="multiple_reachable_intersection_areas",
+                )
             )
             continue
 
         intersection_area_id = next(iter(reachable_area_ids))
-        candidate_node_ids: set[str] = set()
-        for relation_id in relation_ids:
-            regulatory_element = traffic_light_regs[relation_id]
-            for lanelet_id in attached_road_lanelet_ids:
-                if lanelet_id not in lanelets_by_regulatory_element.get(relation_id, ()):
-                    continue
-                group_id = lanelet_to_group.get(lanelet_id)
-                if group_id is None:
-                    continue
-                endpoint = _traffic_light_stopline_endpoint(
-                    lanelet_map,
-                    road_lanelets[lanelet_id],
-                    regulatory_element,
-                )
-                stopline_node_key = f"{group_id}:{endpoint or 'end'}"
-                if stopline_node_key in node_ids:
-                    candidate_node_ids.add(node_ids[stopline_node_key])
+        candidate_node_ids = candidate_stopline_node_ids(relation_ids, attached_road_lanelet_ids)
 
         cluster_node_key = f"cluster:{intersection_area_id}"
         if not candidate_node_ids and intersection_area_id in intersection_clusters and cluster_node_key in node_ids:
             candidate_node_ids.add(node_ids[cluster_node_key])
 
         if not candidate_node_ids:
+            reason = "stopline_or_cluster_node_not_exported"
             unmapped_signals.append(
                 {
                     "relation_ids": list(relation_ids),
-                    "reason": "stopline_or_cluster_node_not_exported",
+                    "reason": reason,
                     "intersection_area_id": intersection_area_id,
                 }
+            )
+            signal_mapping_records.append(
+                _signal_mapping_record(
+                    relation_ids=relation_ids,
+                    traffic_light_regs=traffic_light_regs,
+                    attached_lanelet_ids=attached_lanelet_ids,
+                    intersection_area_id=intersection_area_id,
+                    planned_sumo_tls_id=f"tls_{intersection_area_id}",
+                    resolution_status="unmapped",
+                    reason=reason,
+                )
             )
             continue
 
@@ -1974,6 +2062,18 @@ def _plan_vehicle_signals(
         for node_id in sorted(candidate_node_ids, key=_sort_key):
             tls_ids_by_node_id[node_id] = tls_id
         mapped_relation_ids.update(relation_ids)
+        signal_mapping_records.append(
+            _signal_mapping_record(
+                relation_ids=relation_ids,
+                traffic_light_regs=traffic_light_regs,
+                attached_lanelet_ids=attached_lanelet_ids,
+                intersection_area_id=intersection_area_id,
+                planned_sumo_tls_id=tls_id,
+                candidate_intersection_area_ids=(intersection_area_id,),
+                planned_sumo_node_ids=candidate_node_ids,
+                resolution_status="planned_only",
+            )
+        )
         if not ref_line_way_ids:
             inferred_no_refline_count += 1
 
@@ -1983,6 +2083,7 @@ def _plan_vehicle_signals(
         if _is_vehicle_traffic_light_regulatory_element(lanelet_map, regulatory_element)
         and tuple(sorted(regulatory_element.members_by_role.get("refers", ()), key=_sort_key)) in head_keys
     }
+    vehicle_relation_ids.difference_update(excluded_relation_ids)
     signal_summary = {
         "raw_relation_count": len(traffic_light_regs),
         "normalized_head_count": len(head_keys),
@@ -1991,9 +2092,13 @@ def _plan_vehicle_signals(
         "tls_cluster_count": 0,
         "vehicle_tls_link_count": 0,
         "inferred_no_refline_count": inferred_no_refline_count,
+        "excluded_non_vehicle_relation_count": len(excluded_relation_ids),
         "unmapped_relation_count": len(vehicle_relation_ids - mapped_relation_ids),
     }
-    return tls_ids_by_node_id, signal_summary, unmapped_signals
+    return tls_ids_by_node_id, signal_summary, unmapped_signals, sorted(
+        signal_mapping_records,
+        key=_signal_mapping_record_sort_key,
+    )
 
 
 def _run_netconvert(
@@ -2170,6 +2275,7 @@ def convert_map(
     joined_connection_delete_path = out_dir / "network.joined-delete.con.xml"
     patched_net_path = out_dir / "network.joined-filtered.net.xml"
     sidecar_path = out_dir / "retention.sidecar.json"
+    signal_id_mapping_path = out_dir / "signal_id_mapping.json"
     report_path = out_dir / "conversion.report.json"
 
     sidecar: dict[str, object] = {
@@ -2192,6 +2298,15 @@ def convert_map(
         lane_change_mode,
         sidecar,
     )
+    lanelet_paths_by_lane_key = _lanelet_paths_by_sumo_lane_key(
+        exported_lane_groups,
+        lanelet_to_lane_index,
+    )
+    signal_lanelet_paths_by_lane_key = _extend_lanelet_paths_to_intersection_entry(
+        lanelet_paths_by_lane_key,
+        successors,
+        road_lanelets,
+    )
     signal_summary = {
         "raw_relation_count": 0,
         "normalized_head_count": 0,
@@ -2204,8 +2319,10 @@ def convert_map(
     }
     unmapped_signals: list[dict[str, object]] = []
     tls_ids_by_node_id: dict[str, str] = {}
+    signal_mapping_records: list[SignalMappingRecord] = []
+    signal_mapping_summary: dict[str, object] | None = None
     if signal_mode == "jp-static":
-        tls_ids_by_node_id, signal_summary, unmapped_signals = _plan_vehicle_signals(
+        tls_ids_by_node_id, signal_summary, unmapped_signals, signal_mapping_records = _plan_vehicle_signals(
             lanelet_map,
             road_lanelets,
             successors,
@@ -2309,6 +2426,27 @@ def convert_map(
         geo_location_patched = patch_net_location(net_path, lanelet_map.geo_reference)
         connectivity_summary = net_postprocess._summarize_net_connectivity_and_write_safe_weights(net_path, out_dir)
 
+    if signal_mode == "jp-static":
+        signal_mapping_records = _resolve_signal_mapping_records(
+            signal_mapping_records,
+            net_path if run_netconvert else None,
+            signal_lanelet_paths_by_lane_key if run_netconvert else None,
+        )
+        signal_link_mapping_records = _build_sumo_link_signal_mapping_records(
+            signal_mapping_records,
+            net_path if run_netconvert else None,
+            signal_lanelet_paths_by_lane_key,
+        )
+        signal_mapping_summary = _write_signal_id_mapping_json(
+            signal_id_mapping_path,
+            signal_mode,
+            signal_mapping_records,
+            signal_link_mapping_records,
+            net_path if run_netconvert else None,
+        )
+    elif signal_id_mapping_path.exists():
+        signal_id_mapping_path.unlink()
+
     sidecar["ignored_lanelets_by_subtype"] = dict(sorted(ignored_subtypes.items()))
     sidecar["geo_reference"] = _geo_reference_dict(lanelet_map.geo_reference, geo_location_patched)
     sidecar["intersection_area_junction_clusters"] = {
@@ -2366,6 +2504,8 @@ def convert_map(
             "tls_ids_by_node_id": dict(sorted(tls_ids_by_node_id.items(), key=lambda item: _sort_key(item[0]))),
             "unmapped_signals": unmapped_signals,
         }
+        sidecar["signal_id_mapping_path"] = str(signal_id_mapping_path)
+        sidecar["signal_id_mapping_summary"] = signal_mapping_summary
     sidecar["intersection_area_node_joins"] = {
         node_join.intersection_area_id: {
             "join_id": node_join.join_id,
@@ -2406,6 +2546,9 @@ def convert_map(
         "intersection_area_node_join_summary": intersection_area_node_join_summary,
         "geo_reference": _geo_reference_dict(lanelet_map.geo_reference, geo_location_patched),
     }
+    if signal_mode == "jp-static":
+        report["signal_id_mapping_path"] = str(signal_id_mapping_path)
+        report["signal_id_mapping_summary"] = signal_mapping_summary
     if netconvert_result is not None:
         report["netconvert"] = {
             "binary": netconvert_binary,
@@ -2464,6 +2607,7 @@ def convert_map(
         "connections_path": str(connections_path),
         "net_path": str(net_path) if run_netconvert else None,
         "sidecar_path": str(sidecar_path),
+        "signal_mapping_path": str(signal_id_mapping_path) if signal_mode == "jp-static" else None,
         "report_path": str(report_path),
     }
 
