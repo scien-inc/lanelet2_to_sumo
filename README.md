@@ -117,10 +117,18 @@ out/example-network/
   network.net.xml
   conversion.report.json
   retention.sidecar.json
+  signal_id_mapping.json
   randomtrips.safe.src.xml
   randomtrips.safe.dst.xml
   randomtrips.safe.via.xml
 ```
+
+`signal_id_mapping.json` is emitted for the default `--signal-mode jp-static`.
+It contains both group-level Lanelet2 signal mappings and SUMO connection-level mappings:
+
+- `lanelet_to_sumo`: Lanelet2 traffic-light regulatory elements and `refers` / `ref_line` way IDs mapped to the final SUMO `<tlLogic id>`.
+- `sumo_link_to_lanelet_signal`: final SUMO `tlLogic id + linkIndex` records mapped back to Lanelet2 `refers` way IDs, including diagnostic fallback candidates.
+- `lanelet_signal_to_sumo_links`: runtime synchronization lookup keyed by Lanelet2 `refers` way ID. It contains direct source-lanelet matches only; fallback candidates stay in `sumo_link_to_lanelet_signal` for diagnostics.
 
 Open the generated network in SUMO GUI on the host:
 
@@ -251,6 +259,7 @@ Main options:
 - lanelet / edge / connection counts
 - lane-change summary
 - signal conversion summary
+- signal ID mapping summary
 - TLS phase patch summary
 - lane length vs shape patch summary
 - internal lane shape audit
