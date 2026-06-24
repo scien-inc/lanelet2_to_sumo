@@ -11,7 +11,7 @@ from ll2sumo.model import Lanelet, RegulatoryElement
 from ll2sumo.sumo_xml import id_sort_key as _sort_key
 
 
-SIGNAL_MAPPING_SCHEMA_VERSION = 2
+SIGNAL_MAPPING_SCHEMA_VERSION = 3
 MAX_SIGNAL_MAPPING_EXAMPLES = 20
 
 SignalMappingRecord = dict[str, object]
@@ -368,6 +368,10 @@ def _signal_mapping_records_by_actual_tls(
     }
 
 
+def _signal_mapping_record_identity(record: SignalMappingRecord) -> tuple[str, ...]:
+    return tuple(_record_string_list(record, "lanelet_regulatory_element_ids"))
+
+
 def _sumo_link_signal_mapping_record(
     connection: ET.Element,
     link_index: int,
@@ -406,6 +410,129 @@ def _sumo_link_signal_mapping_record(
     return record
 
 
+def _link_timing_category_pattern(
+    tls_phase_states: dict[str, list[str]],
+    tls_id: object,
+    link_index: object,
+) -> tuple[str, ...]:
+    if not isinstance(tls_id, str) or not isinstance(link_index, int):
+        return tuple()
+    return tuple(
+        _tls_state_category(state[link_index]) if 0 <= link_index < len(state) else "missing"
+        for state in tls_phase_states.get(tls_id, [])
+    )
+
+
+def _sync_way_status(
+    record: SignalLinkMappingRecord,
+    way_id: str,
+) -> str | None:
+    statuses = record.get("sync_status_by_lanelet_traffic_light_way_id", {})
+    if not isinstance(statuses, dict):
+        return None
+    status = statuses.get(way_id)
+    return str(status) if status is not None else None
+
+
+def _sync_way_status_values(record: SignalLinkMappingRecord) -> set[str]:
+    statuses = record.get("sync_status_by_lanelet_traffic_light_way_id", {})
+    if not isinstance(statuses, dict):
+        return set()
+    return {str(status) for status in statuses.values()}
+
+
+def _eligible_way_ids(record: SignalLinkMappingRecord) -> list[str]:
+    way_ids = record.get("sync_lanelet_traffic_light_way_ids", [])
+    if not isinstance(way_ids, list):
+        return []
+    return [str(way_id) for way_id in way_ids]
+
+
+def _aggregate_sync_status(way_statuses: dict[str, str], match_status: object) -> str:
+    if not way_statuses:
+        return "unmapped" if match_status == "unmapped" else "no_lanelet_signal"
+    statuses = set(way_statuses.values())
+    if len(statuses) == 1:
+        return next(iter(statuses))
+    if any(status.startswith("primary_") for status in statuses):
+        return "mixed_sync_status"
+    if "conflicting_timing" in statuses:
+        return "conflicting_timing"
+    if "diagnostic_fallback" in statuses:
+        return "diagnostic_fallback"
+    return sorted(statuses)[0]
+
+
+def _annotate_link_records_for_signal_sync(
+    link_records: list[SignalLinkMappingRecord],
+    tls_phase_states: dict[str, list[str]],
+) -> list[SignalLinkMappingRecord]:
+    annotated_records: list[SignalLinkMappingRecord] = []
+    pattern_counts_by_way_tls: dict[tuple[str, str], Counter[tuple[str, ...]]] = defaultdict(Counter)
+    matched_pattern_counts_by_way_tls: dict[tuple[str, str], Counter[tuple[str, ...]]] = defaultdict(Counter)
+
+    for record in link_records:
+        annotated = dict(record)
+        tls_id = annotated.get("actual_sumo_tls_id")
+        link_index = annotated.get("linkIndex")
+        pattern = _link_timing_category_pattern(tls_phase_states, tls_id, link_index)
+        annotated["timing_category_pattern"] = list(pattern)
+        annotated_records.append(annotated)
+        if annotated.get("match_status") == "unmapped" or not isinstance(tls_id, str):
+            continue
+        for way_id in _record_string_list(annotated, "lanelet_traffic_light_way_ids"):
+            key = (way_id, tls_id)
+            pattern_counts_by_way_tls[key][pattern] += 1
+            if annotated.get("match_status") == "matched":
+                matched_pattern_counts_by_way_tls[key][pattern] += 1
+
+    primary_pattern_by_way_tls: dict[tuple[str, str], tuple[str, ...]] = {}
+    for key, pattern_counts in pattern_counts_by_way_tls.items():
+        matched_counts = matched_pattern_counts_by_way_tls.get(key)
+        counts = matched_counts if matched_counts else pattern_counts
+        primary_pattern_by_way_tls[key] = sorted(
+            counts,
+            key=lambda pattern: (
+                -counts[pattern],
+                -pattern_counts[pattern],
+                pattern,
+            ),
+        )[0]
+
+    for record in annotated_records:
+        tls_id = record.get("actual_sumo_tls_id")
+        pattern = tuple(_record_string_list(record, "timing_category_pattern"))
+        way_statuses: dict[str, str] = {}
+        eligible_way_ids: list[str] = []
+
+        if isinstance(tls_id, str) and record.get("match_status") != "unmapped":
+            for way_id in _record_string_list(record, "lanelet_traffic_light_way_ids"):
+                primary_pattern = primary_pattern_by_way_tls.get((way_id, tls_id))
+                if primary_pattern is None:
+                    continue
+                if pattern == primary_pattern:
+                    if record.get("match_status") == "matched":
+                        status = "primary_matched"
+                    else:
+                        status = "primary_fallback"
+                    eligible_way_ids.append(way_id)
+                elif record.get("match_status") == "matched":
+                    status = "conflicting_timing"
+                else:
+                    status = "diagnostic_fallback"
+                way_statuses[way_id] = status
+
+        record["sync_lanelet_traffic_light_way_ids"] = sorted(eligible_way_ids, key=_sort_key)
+        record["sync_eligible"] = bool(eligible_way_ids)
+        record["sync_status_by_lanelet_traffic_light_way_id"] = {
+            way_id: way_statuses[way_id]
+            for way_id in sorted(way_statuses, key=_sort_key)
+        }
+        record["sync_status"] = _aggregate_sync_status(way_statuses, record.get("match_status"))
+
+    return sorted(annotated_records, key=_link_mapping_record_sort_key)
+
+
 def _build_sumo_link_signal_mapping_records(
     records: list[SignalMappingRecord],
     net_path: str | Path | None,
@@ -421,6 +548,8 @@ def _build_sumo_link_signal_mapping_records(
     tls_ids = _net_tls_ids(root)
     records_by_tls = _signal_mapping_records_by_actual_tls(records)
     link_records: list[SignalLinkMappingRecord] = []
+    connection_matches: list[tuple[ET.Element, int, tuple[str, ...], list[SignalMappingRecord], list[SignalMappingRecord]]] = []
+    matched_record_ids_by_tls: dict[str, set[tuple[str, ...]]] = defaultdict(set)
 
     for connection in root.findall("connection"):
         tls_id = connection.attrib.get("tl")
@@ -440,6 +569,11 @@ def _build_sumo_link_signal_mapping_records(
             for record in candidates
             if source_lanelet_id_set.intersection(_record_string_list(record, "attached_lanelet_ids"))
         ]
+        matched_record_ids_by_tls[str(tls_id)].update(_signal_mapping_record_identity(record) for record in matched)
+        connection_matches.append((connection, link_index, source_lanelet_ids, candidates, matched))
+
+    for connection, link_index, source_lanelet_ids, candidates, matched in connection_matches:
+        tls_id = str(connection.attrib.get("tl"))
         if matched:
             for record in matched:
                 link_records.append(
@@ -451,9 +585,16 @@ def _build_sumo_link_signal_mapping_records(
                         "matched",
                     )
                 )
-            continue
-        if candidates:
-            for record in candidates:
+            fallback_candidates = [
+                record
+                for record in candidates
+                if _signal_mapping_record_identity(record) not in matched_record_ids_by_tls[tls_id]
+            ]
+        else:
+            fallback_candidates = candidates
+
+        if fallback_candidates:
+            for record in fallback_candidates:
                 link_records.append(
                     _sumo_link_signal_mapping_record(
                         connection,
@@ -464,15 +605,17 @@ def _build_sumo_link_signal_mapping_records(
                     )
                 )
             continue
-        link_records.append(
-            _sumo_link_signal_mapping_record(
-                connection,
-                link_index,
-                source_lanelet_ids,
-                None,
-                "unmapped",
+
+        if not matched:
+            link_records.append(
+                _sumo_link_signal_mapping_record(
+                    connection,
+                    link_index,
+                    source_lanelet_ids,
+                    None,
+                    "unmapped",
+                )
             )
-        )
 
     return sorted(link_records, key=_link_mapping_record_sort_key)
 
@@ -483,7 +626,7 @@ def _lanelet_signal_to_sumo_links(
     entries: dict[str, list[dict[str, object]]] = defaultdict(list)
     seen: set[tuple[object, ...]] = set()
     for record in sorted(link_records, key=_link_mapping_record_sort_key):
-        for way_id in _record_string_list(record, "lanelet_traffic_light_way_ids"):
+        for way_id in _eligible_way_ids(record):
             entry = {
                 "actual_sumo_tls_id": record.get("actual_sumo_tls_id"),
                 "linkIndex": record.get("linkIndex"),
@@ -494,6 +637,8 @@ def _lanelet_signal_to_sumo_links(
                 "via": record.get("via"),
                 "dir": record.get("dir"),
                 "match_status": record.get("match_status"),
+                "sync_status": _sync_way_status(record, way_id) or record.get("sync_status"),
+                "timing_category_pattern": _record_string_list(record, "timing_category_pattern"),
                 "lanelet_regulatory_element_ids": _record_string_list(record, "lanelet_regulatory_element_ids"),
                 "intersection_area_id": record.get("intersection_area_id"),
                 "planned_sumo_tls_id": record.get("planned_sumo_tls_id"),
@@ -541,6 +686,9 @@ def _tls_state_category(state: str) -> str:
 def _audit_mixed_lanelet_signal_phase_states(
     link_records: list[SignalLinkMappingRecord],
     tls_phase_states: dict[str, list[str]],
+    *,
+    sync_only: bool = False,
+    example_type: str = "mixed_lanelet_signal_phase",
 ) -> tuple[int, list[dict[str, object]]]:
     links_by_way_and_tls: dict[tuple[str, str], set[int]] = defaultdict(set)
     for record in link_records:
@@ -550,7 +698,8 @@ def _audit_mixed_lanelet_signal_phase_states(
             continue
         if record.get("match_status") == "unmapped":
             continue
-        for way_id in _record_string_list(record, "lanelet_traffic_light_way_ids"):
+        way_ids = _eligible_way_ids(record) if sync_only else _record_string_list(record, "lanelet_traffic_light_way_ids")
+        for way_id in way_ids:
             links_by_way_and_tls[(way_id, tls_id)].add(link_index)
 
     mixed_count = 0
@@ -571,7 +720,7 @@ def _audit_mixed_lanelet_signal_phase_states(
             if len(examples) < MAX_SIGNAL_MAPPING_EXAMPLES:
                 examples.append(
                     {
-                        "type": "mixed_lanelet_signal_phase",
+                        "type": example_type,
                         "lanelet_traffic_light_way_id": way_id,
                         "actual_sumo_tls_id": tls_id,
                         "phase_index": phase_index,
@@ -589,7 +738,9 @@ def _signal_mapping_summary(
     link_records: list[SignalLinkMappingRecord],
     net_tls_ids: set[str] | None = None,
     mixed_phase_count: int = 0,
+    diagnostic_mixed_phase_count: int = 0,
     mixed_phase_examples: list[dict[str, object]] | None = None,
+    diagnostic_mixed_phase_examples: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     regulatory_element_ids = {
         relation_id
@@ -603,6 +754,7 @@ def _signal_mapping_summary(
     }
     status_counts = Counter(str(record.get("resolution_status", "")) for record in records)
     link_status_counts = Counter(str(record.get("match_status", "")) for record in link_records)
+    sync_status_counts = Counter(str(record.get("sync_status", "")) for record in link_records)
     covered_tls_ids = set(sumo_to_lanelet)
     covered_tls_ids.update(
         str(record.get("actual_sumo_tls_id"))
@@ -611,6 +763,7 @@ def _signal_mapping_summary(
     )
     unmapped_tls_ids = sorted((net_tls_ids or set()) - covered_tls_ids, key=_sort_key)
     examples = list(mixed_phase_examples or [])
+    examples.extend(diagnostic_mixed_phase_examples or [])
     for tls_id in unmapped_tls_ids:
         if len(examples) >= MAX_SIGNAL_MAPPING_EXAMPLES:
             break
@@ -635,7 +788,23 @@ def _signal_mapping_summary(
         "unmapped_sumo_link_count": link_status_counts.get("unmapped", 0),
         "unmapped_actual_sumo_tls_count": len(unmapped_tls_ids),
         "mixed_lanelet_signal_phase_count": mixed_phase_count,
-        "examples": examples,
+        "diagnostic_mixed_lanelet_signal_phase_count": diagnostic_mixed_phase_count,
+        "sync_eligible_sumo_link_count": sum(1 for record in link_records if record.get("sync_eligible") is True),
+        "conflicting_timing_link_count": sum(
+            1
+            for record in link_records
+            if "conflicting_timing" in _sync_way_status_values(record)
+            or record.get("sync_status") == "conflicting_timing"
+        ),
+        "diagnostic_fallback_link_count": sum(
+            1
+            for record in link_records
+            if "diagnostic_fallback" in _sync_way_status_values(record)
+            or record.get("sync_status") == "diagnostic_fallback"
+        ),
+        "primary_matched_link_count": sync_status_counts.get("primary_matched", 0),
+        "primary_fallback_link_count": sync_status_counts.get("primary_fallback", 0),
+        "examples": examples[:MAX_SIGNAL_MAPPING_EXAMPLES],
     }
 
 
@@ -706,10 +875,19 @@ def _write_signal_id_mapping_json(
     connection_count_by_tls = _net_tls_connection_counts(root) if root is not None else None
     tls_phase_states = _net_tls_phase_states(root) if root is not None else {}
     sumo_to_lanelet = _sumo_to_lanelet_mapping(sorted_records, connection_count_by_tls)
+    sorted_link_records = _annotate_link_records_for_signal_sync(sorted_link_records, tls_phase_states)
     lanelet_signal_to_sumo_links = _lanelet_signal_to_sumo_links(sorted_link_records)
     mixed_phase_count, mixed_phase_examples = _audit_mixed_lanelet_signal_phase_states(
         sorted_link_records,
         tls_phase_states,
+        sync_only=True,
+        example_type="mixed_lanelet_signal_phase",
+    )
+    diagnostic_mixed_phase_count, diagnostic_mixed_phase_examples = _audit_mixed_lanelet_signal_phase_states(
+        sorted_link_records,
+        tls_phase_states,
+        sync_only=False,
+        example_type="diagnostic_mixed_lanelet_signal_phase",
     )
     summary = _signal_mapping_summary(
         sorted_records,
@@ -717,7 +895,9 @@ def _write_signal_id_mapping_json(
         sorted_link_records,
         net_tls_ids=net_tls_ids,
         mixed_phase_count=mixed_phase_count,
+        diagnostic_mixed_phase_count=diagnostic_mixed_phase_count,
         mixed_phase_examples=mixed_phase_examples,
+        diagnostic_mixed_phase_examples=diagnostic_mixed_phase_examples,
     )
     document = {
         "schema_version": SIGNAL_MAPPING_SCHEMA_VERSION,

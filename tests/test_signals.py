@@ -574,6 +574,8 @@ class VehicleSignalPlanningTest(unittest.TestCase):
             self.assertEqual(link_records[0]["match_status"], "tls_group_fallback")
             self.assertEqual(summary["fallback_sumo_link_count"], 1)
             self.assertEqual(document["lanelet_signal_to_sumo_links"]["signal_way_a"][0]["match_status"], "tls_group_fallback")
+            self.assertEqual(document["lanelet_signal_to_sumo_links"]["signal_way_a"][0]["sync_status"], "primary_fallback")
+            self.assertTrue(document["sumo_link_to_lanelet_signal"][0]["sync_eligible"])
 
     def test_signal_link_mapping_indexes_by_refers_way_and_audits_phase_mixing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -620,15 +622,189 @@ class VehicleSignalPlanningTest(unittest.TestCase):
             document = json.loads(mapping_path.read_text(encoding="utf-8"))
 
             self.assertEqual(summary["matched_sumo_link_count"], 2)
-            self.assertEqual(summary["mixed_lanelet_signal_phase_count"], 1)
+            self.assertEqual(summary["mixed_lanelet_signal_phase_count"], 0)
+            self.assertEqual(summary["diagnostic_mixed_lanelet_signal_phase_count"], 1)
+            self.assertEqual(
+                [entry["linkIndex"] for entry in document["lanelet_signal_to_sumo_links"]["signal_way_a"]],
+                [0],
+            )
+            self.assertEqual(
+                document["summary"]["examples"][0]["type"],
+                "diagnostic_mixed_lanelet_signal_phase",
+            )
+            self.assertEqual(document["sumo_link_to_lanelet_signal"][0]["sync_status"], "primary_matched")
+            self.assertEqual(document["sumo_link_to_lanelet_signal"][1]["sync_status"], "conflicting_timing")
+
+    def test_signal_link_mapping_keeps_only_matched_timing_when_fallback_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            net_path = temp_path / "network.net.xml"
+            mapping_path = temp_path / "signal_id_mapping.json"
+            net_path.write_text(
+                """<?xml version="1.0" encoding="utf-8"?>
+<net>
+  <tlLogic id="cluster_tls" type="static" programID="0" offset="0">
+    <phase duration="35" state="Gr"/>
+    <phase duration="35" state="rG"/>
+  </tlLogic>
+  <connection from="edge_matched" to="edge_out" fromLane="0" toLane="0" via=":ia_1_0_0" tl="cluster_tls" linkIndex="0"/>
+  <connection from="edge_unknown" to="edge_other" fromLane="0" toLane="0" via=":ia_1_1_0" tl="cluster_tls" linkIndex="1"/>
+</net>
+""",
+                encoding="utf-8",
+            )
+            records = [
+                {
+                    "lanelet_regulatory_element_ids": ["reg_a"],
+                    "lanelet_traffic_light_way_ids": ["signal_way_a"],
+                    "lanelet_ref_line_way_ids": ["stop_line_a"],
+                    "attached_lanelet_ids": ["lanelet_a"],
+                    "intersection_area_id": "1",
+                    "planned_sumo_tls_id": "tls_1",
+                    "planned_sumo_node_ids": ["node_a"],
+                    "actual_sumo_tls_ids": ["cluster_tls"],
+                    "actual_sumo_junction_ids": ["ia_1"],
+                    "actual_sumo_connection_count": 2,
+                    "resolution_status": "mapped",
+                }
+            ]
+
+            link_records = _build_sumo_link_signal_mapping_records(
+                records,
+                net_path,
+                {("edge_matched", "0"): ("lanelet_a",)},
+            )
+            summary = _write_signal_id_mapping_json(mapping_path, "jp-static", records, link_records, net_path)
+            document = json.loads(mapping_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["mixed_lanelet_signal_phase_count"], 0)
+            self.assertEqual(summary["diagnostic_mixed_lanelet_signal_phase_count"], 2)
+            self.assertEqual(
+                [entry["linkIndex"] for entry in document["lanelet_signal_to_sumo_links"]["signal_way_a"]],
+                [0],
+            )
+            self.assertEqual(document["sumo_link_to_lanelet_signal"][0]["sync_status"], "primary_matched")
+            self.assertEqual(document["sumo_link_to_lanelet_signal"][1]["sync_status"], "diagnostic_fallback")
+            self.assertFalse(document["sumo_link_to_lanelet_signal"][1]["sync_eligible"])
+
+    def test_signal_link_mapping_keeps_fallback_for_records_without_any_matched_link(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            net_path = temp_path / "network.net.xml"
+            mapping_path = temp_path / "signal_id_mapping.json"
+            net_path.write_text(
+                """<?xml version="1.0" encoding="utf-8"?>
+<net>
+  <tlLogic id="cluster_tls" type="static" programID="0" offset="0">
+    <phase duration="35" state="G"/>
+  </tlLogic>
+  <connection from="edge_a" to="edge_out" fromLane="0" toLane="0" via=":ia_1_0_0" tl="cluster_tls" linkIndex="0"/>
+</net>
+""",
+                encoding="utf-8",
+            )
+            records = [
+                {
+                    "lanelet_regulatory_element_ids": ["reg_a"],
+                    "lanelet_traffic_light_way_ids": ["signal_way_a"],
+                    "lanelet_ref_line_way_ids": ["stop_line_a"],
+                    "attached_lanelet_ids": ["lanelet_a"],
+                    "intersection_area_id": "1",
+                    "planned_sumo_tls_id": "tls_1",
+                    "planned_sumo_node_ids": ["node_a"],
+                    "actual_sumo_tls_ids": ["cluster_tls"],
+                    "actual_sumo_junction_ids": ["ia_1"],
+                    "actual_sumo_connection_count": 1,
+                    "resolution_status": "mapped",
+                },
+                {
+                    "lanelet_regulatory_element_ids": ["reg_b"],
+                    "lanelet_traffic_light_way_ids": ["signal_way_b"],
+                    "lanelet_ref_line_way_ids": ["stop_line_b"],
+                    "attached_lanelet_ids": ["lanelet_b"],
+                    "intersection_area_id": "1",
+                    "planned_sumo_tls_id": "tls_1",
+                    "planned_sumo_node_ids": ["node_b"],
+                    "actual_sumo_tls_ids": ["cluster_tls"],
+                    "actual_sumo_junction_ids": ["ia_1"],
+                    "actual_sumo_connection_count": 1,
+                    "resolution_status": "mapped",
+                },
+            ]
+
+            link_records = _build_sumo_link_signal_mapping_records(
+                records,
+                net_path,
+                {("edge_a", "0"): ("lanelet_a",)},
+            )
+            summary = _write_signal_id_mapping_json(mapping_path, "jp-static", records, link_records, net_path)
+            document = json.loads(mapping_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["mixed_lanelet_signal_phase_count"], 0)
+            self.assertEqual(summary["sync_eligible_sumo_link_count"], 2)
+            self.assertEqual(
+                [entry["match_status"] for entry in document["lanelet_signal_to_sumo_links"]["signal_way_a"]],
+                ["matched"],
+            )
+            self.assertEqual(
+                [entry["match_status"] for entry in document["lanelet_signal_to_sumo_links"]["signal_way_b"]],
+                ["tls_group_fallback"],
+            )
+
+    def test_signal_link_mapping_does_not_conflict_on_protected_and_permissive_green(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            net_path = temp_path / "network.net.xml"
+            mapping_path = temp_path / "signal_id_mapping.json"
+            net_path.write_text(
+                """<?xml version="1.0" encoding="utf-8"?>
+<net>
+  <tlLogic id="cluster_tls" type="static" programID="0" offset="0">
+    <phase duration="35" state="Gg"/>
+    <phase duration="3" state="yy"/>
+    <phase duration="2" state="rr"/>
+  </tlLogic>
+  <connection from="edge_a" to="edge_out" fromLane="0" toLane="0" via=":ia_1_0_0" tl="cluster_tls" linkIndex="0"/>
+  <connection from="edge_b" to="edge_out" fromLane="0" toLane="0" via=":ia_1_1_0" tl="cluster_tls" linkIndex="1"/>
+</net>
+""",
+                encoding="utf-8",
+            )
+            records = [
+                {
+                    "lanelet_regulatory_element_ids": ["reg_a"],
+                    "lanelet_traffic_light_way_ids": ["signal_way_a"],
+                    "lanelet_ref_line_way_ids": ["stop_line_a"],
+                    "attached_lanelet_ids": ["lanelet_a", "lanelet_b"],
+                    "intersection_area_id": "1",
+                    "planned_sumo_tls_id": "tls_1",
+                    "planned_sumo_node_ids": ["node_a"],
+                    "actual_sumo_tls_ids": ["cluster_tls"],
+                    "actual_sumo_junction_ids": ["ia_1"],
+                    "actual_sumo_connection_count": 2,
+                    "resolution_status": "mapped",
+                }
+            ]
+
+            link_records = _build_sumo_link_signal_mapping_records(
+                records,
+                net_path,
+                {
+                    ("edge_a", "0"): ("lanelet_a",),
+                    ("edge_b", "0"): ("lanelet_b",),
+                },
+            )
+            summary = _write_signal_id_mapping_json(mapping_path, "jp-static", records, link_records, net_path)
+            document = json.loads(mapping_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["mixed_lanelet_signal_phase_count"], 0)
+            self.assertEqual(summary["diagnostic_mixed_lanelet_signal_phase_count"], 0)
             self.assertEqual(
                 [entry["linkIndex"] for entry in document["lanelet_signal_to_sumo_links"]["signal_way_a"]],
                 [0, 1],
             )
-            self.assertEqual(
-                document["summary"]["examples"][0]["type"],
-                "mixed_lanelet_signal_phase",
-            )
+            self.assertEqual(document["sumo_link_to_lanelet_signal"][0]["timing_category_pattern"], ["green", "yellow", "red"])
+            self.assertEqual(document["sumo_link_to_lanelet_signal"][1]["timing_category_pattern"], ["green", "yellow", "red"])
 
     def test_signal_mapping_json_groups_multiple_lanelet_signals_by_sumo_tls(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -668,7 +844,7 @@ class VehicleSignalPlanningTest(unittest.TestCase):
             self.assertEqual(summary["mapped_record_count"], 2)
             self.assertEqual(summary["actual_sumo_tls_count"], 1)
             self.assertEqual(summary["lanelet_regulatory_element_count"], 2)
-            self.assertEqual(document["schema_version"], 2)
+            self.assertEqual(document["schema_version"], 3)
             self.assertEqual(document["sumo_link_to_lanelet_signal"], [])
             self.assertEqual(document["lanelet_signal_to_sumo_links"], {})
             self.assertEqual(

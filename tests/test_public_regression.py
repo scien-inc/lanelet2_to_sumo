@@ -220,7 +220,7 @@ class PublicConversionRegressionTest(unittest.TestCase):
             self.assertEqual(Path(result["signal_mapping_path"]), mapping_path)
             self.assertTrue(mapping_path.exists())
             document = json.loads(mapping_path.read_text(encoding="utf-8"))
-            self.assertEqual(document["schema_version"], 2)
+            self.assertEqual(document["schema_version"], 3)
             self.assertEqual(document["summary"]["planned_only_record_count"], 1)
             self.assertEqual(document["summary"]["mapped_record_count"], 0)
             self.assertEqual(document["summary"]["sumo_link_mapping_count"], 0)
