@@ -179,6 +179,25 @@ It contains both group-level Lanelet2 signal mappings and SUMO connection-level 
 - `sumo_link_to_lanelet_signal`: final SUMO `tlLogic id + linkIndex` records mapped back to Lanelet2 `refers` way IDs, including diagnostic fallback candidates.
 - `lanelet_signal_to_sumo_links`: runtime synchronization lookup keyed by Lanelet2 `refers` way ID. It contains direct source-lanelet matches only; fallback candidates stay in `sumo_link_to_lanelet_signal` for diagnostics.
 
+To include CARLA signal synchronization metadata in the generated net, supply the
+Lanelet2/OpenDRIVE mapping JSON from the OpenDRIVE converter:
+
+```bash
+ll2sumo --input map/input.osm --out-dir out/example-network \
+  --lane-change-mode unrestricted \
+  --opendrive-lanelet-mapping map/opendrive.mapping.json
+```
+
+The JSON must contain
+`traffic_light_signal_mapping.lanelet2_tl_id_to_signal_ids`. Only eligible
+connection mappings from the final network are written as `linkSignalID:<index>`
+params. IDs retain their original values with an `od:` prefix. No OpenDRIVE file
+or CARLA server is needed. This option requires `jp-static` and netconvert.
+Invalid indices, zero output, or coverage below 90% fail conversion; diagnostics
+are saved in `conversion.report.json` under `tls_linksignal`. Coverage counts
+mapped eligible records, independently of deduplicated output params. Conflicting
+signal bindings are listed for inspection; adding metadata does not change phases.
+
 Open the generated network in SUMO GUI:
 
 ```bash
@@ -273,6 +292,9 @@ Main options:
 - `--signal-mode none`
   - Disables signal export.
 
+- `--opendrive-lanelet-mapping map/opendrive.mapping.json`
+  - Adds signal synchronization params using the supplied mapping. Requires `jp-static` and netconvert.
+
 - `--skip-netconvert`
   - Writes SUMO plain XML files but does not build `network.net.xml`.
   - This path needs no SUMO installation at all.
@@ -292,7 +314,7 @@ Main options:
 - TLS phase patch summary
 - lane length vs shape patch summary
 - internal lane shape audit
-- internal lane repair summary
+- source geometry restoration and unresolved connection reasons
 - connection shape summary
 - connectivity summary
 
@@ -300,10 +322,20 @@ Check these fields first when validating a generated network:
 
 ```text
 internal_shape_audit.degenerate_internal_lane_count
-internal_shape_repair.repaired_internal_lane_count
+internal_connection_shape_align.repaired_internal_lane_count
+internal_connection_shape_align.unrepaired_connections
+internal_shape_audit.discontinuity_counts
 connection_shape_summary.unshaped_connection_count
 connectivity_summary
 ```
+
+Normal lane geometry is restored from the Lanelet2-derived plain XML before
+connection geometry is aligned. Short junction stubs use the first 0.25 m of the
+successor centerline and trim that same interval from the successor. Split via
+chains retain separate lane shapes. Unresolvable successor groups retain their
+existing connection geometry and adjoining endpoints; their IDs and reasons are
+reported. Geometry and lengths may therefore differ from earlier output, and
+existing routes should be revalidated against a regenerated network.
 
 ## Docker
 

@@ -9,6 +9,7 @@ import unittest
 import xml.etree.ElementTree as ET
 
 from ll2sumo.convert import (
+    convert_map,
     IntersectionCluster,
     LaneGroup,
     _build_sumo_link_signal_mapping_records,
@@ -22,6 +23,7 @@ from ll2sumo.convert import (
     _write_signal_id_mapping_json,
     _write_nodes_xml,
 )
+from ll2sumo.signal_mapping import _write_tls_linksignal_params
 from ll2sumo.model import Lanelet, LaneletMap, Point3D, RegulatoryElement, Way
 
 
@@ -938,6 +940,89 @@ class NetconvertTlsBuildingTest(unittest.TestCase):
         self.assertIn("network.filtered.net.xml", command)
         self.assertNotIn("--node-files", command)
         self.assertNotIn("--edge-files", command)
+
+
+class SignalParamsTest(unittest.TestCase):
+    def _record(self, index=0, relation="10", eligible=True):
+        return {"actual_sumo_tls_id": "tls", "linkIndex": index, "sync_eligible": eligible,
+                "lanelet_regulatory_element_ids": [relation], "lanelet_traffic_light_way_ids": ["20"],
+                "sync_lanelet_traffic_light_way_ids": ["20"]}
+
+    def _generate(self, directory, records, mapping):
+        net = Path(directory) / "net.xml"
+        net.write_text('<net><edge id="a"><lane id="a_0" shape="0,0 1,0"/></edge><tlLogic id="tls"><phase state="Gr" duration="10"/><phase state="rG" duration="10"/><param key="unrelated" value="keep"/><param key="linkSignalID:0" value="stale"/></tlLogic><connection from="a" to="b" fromLane="0" toLane="0" tl="tls" linkIndex="0"/><connection from="a" to="c" fromLane="0" toLane="0" tl="tls" linkIndex="1"/></net>')
+        signals = Path(directory) / "signals.json"
+        signals.write_text(json.dumps({"sumo_link_to_lanelet_signal": records}))
+        ids = Path(directory) / "ids.json"
+        ids.write_text(json.dumps({"traffic_light_signal_mapping": {"lanelet2_tl_id_to_signal_ids": mapping}}))
+        before = net.read_bytes()
+        result = _write_tls_linksignal_params(net, signals, ids)
+        return net, signals, ids, before, result
+
+    def test_metadata_is_idempotent_and_preserves_network_and_signal_phases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            net, signals, ids, before, result = self._generate(directory, [self._record(), self._record(1, eligible=False)], {"10": [2000466, "od:abc", 2000466]})
+            self.assertEqual(result["coverage"], 1.0)
+            self.assertEqual(result["params_written"], 1)
+            root = ET.parse(net).getroot()
+            self.assertEqual(root.find("tlLogic/param[@key='linkSignalID:0']").get("value"), "od:2000466 od:abc")
+            old = ET.fromstring(before)
+            for tree in (old, root):
+                for param in list(tree.find("tlLogic").findall("param")):
+                    if param.get("key").startswith("linkSignalID:"):
+                        tree.find("tlLogic").remove(param)
+            self.assertEqual([(x.tag, x.attrib) for x in old.iter()], [(x.tag, x.attrib) for x in root.iter()])
+            once = net.read_bytes()
+            _write_tls_linksignal_params(net, signals, ids)
+            self.assertEqual(net.read_bytes(), once)
+
+    def test_invalid_index_zero_output_and_low_coverage_leave_net_unchanged(self):
+        cases = [([self._record(9)], {"10": [1]}, "invalid_link_index"),
+                 ([self._record()], {}, "no_signal_params"),
+                 ([self._record(), self._record(1, "11")], {"10": [1]}, "coverage_below_0.90")]
+        with tempfile.TemporaryDirectory() as directory:
+            for records, mapping, reason in cases:
+                with self.subTest(reason=reason):
+                    net, _, _, before, result = self._generate(directory, records, mapping)
+                    self.assertIn(reason, result["errors"])
+                    self.assertEqual(net.read_bytes(), before)
+
+    def test_conflicting_signal_bindings_are_reported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, _, _, _, result = self._generate(directory, [self._record(), self._record(1)], {"10": [1]})
+            self.assertIn("od:1", result["ambiguous_signal_bindings"])
+            self.assertEqual(result["errors"], [])
+
+    def test_excluded_head_is_not_reintroduced_by_regulatory_mapping(self):
+        with tempfile.TemporaryDirectory() as directory:
+            record = self._record()
+            record["lanelet_traffic_light_way_ids"].append("21")
+            _, _, _, _, result = self._generate(directory, [record], {"10": [1, 2], "20": [1]})
+            self.assertEqual(result["unique_signal_count"], 1)
+
+    def test_conversion_writes_failure_report_before_raising(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            mapping = Path(directory) / "mapping.json"
+            mapping.write_text(json.dumps({"traffic_light_signal_mapping": {"lanelet2_tl_id_to_signal_ids": {}}}))
+
+            def build_net(nodes, edges, connections, net, binary, **kwargs):
+                net.write_text('<net><edge id="edge_0"><lane id="edge_0_0" index="0" length="1" shape="0,0 1,0"/></edge></net>')
+                return CompletedProcess([binary], 0, "", "")
+
+            with patch("ll2sumo.convert._run_netconvert", side_effect=build_net), self.assertRaises(RuntimeError):
+                convert_map(Path(__file__).parent / "fixtures/minimal_road_lanelet.osm", output,
+                            opendrive_lanelet_mapping=mapping)
+            report = json.loads((output / "conversion.report.json").read_text())
+            self.assertIn("no_signal_params", report["tls_linksignal"]["errors"])
+
+    def test_incompatible_options_fail_before_creating_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            for options in ({"signal_mode": "none"}, {"run_netconvert": False}):
+                with self.subTest(options=options), self.assertRaises(ValueError):
+                    convert_map("missing.osm", output, opendrive_lanelet_mapping="missing.json", **options)
+                self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

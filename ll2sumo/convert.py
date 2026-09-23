@@ -39,6 +39,7 @@ from ll2sumo.signal_mapping import (
     _signal_mapping_record,
     _signal_mapping_record_sort_key,
     _write_signal_id_mapping_json,
+    _write_tls_linksignal_params,
 )
 from ll2sumo.sumo_xml import (
     id_sort_key as _sort_key,
@@ -2191,11 +2192,15 @@ def convert_map(
     signal_mode: str = "jp-static",
     run_netconvert: bool = True,
     netconvert_binary: str | None = None,
+    opendrive_lanelet_mapping: str | Path | None = None,
 ) -> dict[str, object]:
     if lane_change_mode not in {"lanelet-infer", "unrestricted"}:
         raise ValueError(f"Unsupported lane change mode: {lane_change_mode}")
     if signal_mode not in {"none", "jp-static"}:
         raise ValueError(f"Unsupported signal mode: {signal_mode}")
+
+    if opendrive_lanelet_mapping is not None and (signal_mode == "none" or not run_netconvert):
+        raise ValueError("OpenDRIVE signal mapping requires --signal-mode jp-static and netconvert")
 
     netconvert_binary = _resolve_netconvert_binary(netconvert_binary)
 
@@ -2382,10 +2387,9 @@ def convert_map(
     tls_phase_patch_summary: dict[str, object] | None = None
     joined_unmapped_connection_cleanup_summary: dict[str, object] | None = None
     joined_connection_patch_result: subprocess.CompletedProcess[str] | None = None
-    internal_connection_shape_sync_summary: dict[str, object] | None = None
     internal_connection_shape_align_summary: dict[str, object] | None = None
     internal_shape_audit_summary: dict[str, object] | None = None
-    internal_shape_repair_summary: dict[str, object] | None = None
+    tls_linksignal_summary: dict[str, object] | None = None
     connectivity_summary: dict[str, object] | None = None
     if run_netconvert:
         build_tls_from_nodes = signal_mode == "jp-static" and bool(tls_ids_by_node_id)
@@ -2424,22 +2428,12 @@ def convert_map(
             tls_phase_patch_summary = net_postprocess._patch_net_japanese_tls_phases(net_path)
             signal_summary["japanese_phase_patch"] = tls_phase_patch_summary
             signal_summary.update(net_postprocess._summarize_net_tls(net_path))
-        internal_connection_shape_sync_summary = net_postprocess._sync_internal_lane_shapes_from_connection_shapes(net_path)
         internal_connection_shape_align_summary = net_postprocess._align_internal_connection_shapes_to_net_lanes(
             net_path,
             plain_connections_path=connections_path,
+            plain_edges_path=edges_path,
         )
         internal_shape_audit_summary = net_postprocess._audit_degenerate_internal_lane_shapes(net_path)
-        if int(internal_shape_audit_summary["degenerate_internal_lane_count"]) > 0:
-            internal_shape_repair_summary = net_postprocess._repair_degenerate_internal_lane_shapes(net_path)
-        else:
-            internal_shape_repair_summary = {
-                "scanned_internal_lane_count": internal_shape_audit_summary["scanned_internal_lane_count"],
-                "degenerate_internal_lane_count": 0,
-                "repaired_internal_lane_count": 0,
-                "unrepaired_internal_lane_count": 0,
-                "examples": [],
-            }
         lane_length_patch_summary = net_postprocess._patch_net_lane_lengths_to_shape(net_path)
         geo_location_patched = patch_net_location(net_path, lanelet_map.geo_reference)
         connectivity_summary = net_postprocess._summarize_net_connectivity_and_write_safe_weights(net_path, out_dir)
@@ -2462,6 +2456,10 @@ def convert_map(
             signal_link_mapping_records,
             net_path if run_netconvert else None,
         )
+        if opendrive_lanelet_mapping is not None:
+            tls_linksignal_summary = _write_tls_linksignal_params(
+                net_path, signal_id_mapping_path, opendrive_lanelet_mapping,
+            )
     elif signal_id_mapping_path.exists():
         signal_id_mapping_path.unlink()
 
@@ -2583,41 +2581,19 @@ def convert_map(
         report["joined_unmapped_connection_cleanup"] = joined_unmapped_connection_cleanup_summary
     if lane_length_patch_summary is not None:
         report["lane_length_shape_patch"] = lane_length_patch_summary
-    if internal_connection_shape_sync_summary is not None:
-        report["internal_connection_shape_sync"] = internal_connection_shape_sync_summary
     if internal_connection_shape_align_summary is not None:
         report["internal_connection_shape_align"] = internal_connection_shape_align_summary
-        report["joined_intersection_shape_summary"] = {
-            "joined_intersection_area_shape_count": connection_shape_summary.get(
-                "joined_intersection_area_shape_count",
-                0,
-            ),
-            "preserved_joined_internal_lane_count": internal_connection_shape_align_summary.get(
-                "preserved_joined_internal_lane_count",
-                0,
-            ),
-            "fallback_joined_internal_lane_count": internal_connection_shape_align_summary.get(
-                "fallback_joined_internal_lane_count",
-                0,
-            ),
-            "plain_joined_connection_shape_count": internal_connection_shape_align_summary.get(
-                "plain_joined_connection_shape_count",
-                0,
-            ),
-            "max_joined_internal_endpoint_gap_after_m": internal_connection_shape_align_summary.get(
-                "max_joined_internal_endpoint_gap_after_m",
-                0.0,
-            ),
-        }
     if internal_shape_audit_summary is not None:
         report["internal_shape_audit"] = internal_shape_audit_summary
-    if internal_shape_repair_summary is not None:
-        report["internal_shape_repair"] = internal_shape_repair_summary
     if connectivity_summary is not None:
         report["connectivity_summary"] = connectivity_summary
     if tls_phase_patch_summary is not None:
         report["tls_phase_patch"] = tls_phase_patch_summary
+    if tls_linksignal_summary is not None:
+        report["tls_linksignal"] = tls_linksignal_summary
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+    if tls_linksignal_summary is not None and tls_linksignal_summary["errors"]:
+        raise RuntimeError(f"Invalid TLS mapping: {tls_linksignal_summary['errors']}. See {report_path}")
 
     return {
         "nodes_path": str(nodes_path),
@@ -2659,6 +2635,10 @@ def main() -> None:
             "NETCONVERT_BINARY, then SUMO_HOME, then the installed eclipse-sumo wheel, then PATH."
         ),
     )
+    parser.add_argument(
+        "--opendrive-lanelet-mapping",
+        help="Lanelet2/OpenDRIVE mapping JSON; adds linkSignalID params for signal synchronization.",
+    )
     args = parser.parse_args()
 
     result = convert_map(
@@ -2668,6 +2648,7 @@ def main() -> None:
         signal_mode=args.signal_mode,
         run_netconvert=not args.skip_netconvert,
         netconvert_binary=args.netconvert_binary,
+        opendrive_lanelet_mapping=args.opendrive_lanelet_mapping,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 
