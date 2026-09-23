@@ -8,6 +8,9 @@ import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+from shutil import which
+
+from sumolib import checkBinary
 
 from ll2sumo.georeference import patch_net_location
 from ll2sumo.geometry import (
@@ -2101,6 +2104,19 @@ def _plan_vehicle_signals(
     )
 
 
+def _resolve_netconvert_binary(explicit: str | None) -> str:
+    """Return the netconvert to run, deferring to SUMO's own binary lookup.
+
+    `sumolib.checkBinary` honours NETCONVERT_BINARY and SUMO_HOME, and falls
+    back to the binary shipped with an installed eclipse-sumo wheel. Its last
+    resort is the bare name, which is resolved here so that the binary that
+    actually ran is recorded in the conversion report.
+    """
+
+    binary = explicit or checkBinary("netconvert")
+    return which(binary) or binary
+
+
 def _run_netconvert(
     nodes_path: Path,
     edges_path: Path,
@@ -2174,12 +2190,14 @@ def convert_map(
     lane_change_mode: str = "lanelet-infer",
     signal_mode: str = "jp-static",
     run_netconvert: bool = True,
-    netconvert_binary: str = "netconvert",
+    netconvert_binary: str | None = None,
 ) -> dict[str, object]:
     if lane_change_mode not in {"lanelet-infer", "unrestricted"}:
         raise ValueError(f"Unsupported lane change mode: {lane_change_mode}")
     if signal_mode not in {"none", "jp-static"}:
         raise ValueError(f"Unsupported signal mode: {signal_mode}")
+
+    netconvert_binary = _resolve_netconvert_binary(netconvert_binary)
 
     input_path = Path(input_path)
     out_dir = Path(out_dir)
@@ -2635,8 +2653,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--netconvert-binary",
-        default="netconvert",
-        help="Path to the netconvert executable.",
+        default=None,
+        help=(
+            "Path to the netconvert executable. Defaults to the SUMO lookup: "
+            "NETCONVERT_BINARY, then SUMO_HOME, then the installed eclipse-sumo wheel, then PATH."
+        ),
     )
     args = parser.parse_args()
 

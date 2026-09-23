@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ll2sumo"
+version = "0.1.0"
+description = "Convert Lanelet2 OSM maps into SUMO networks."
+readme = "README.md"
+requires-python = ">=3.10"
+# pyproj carries PROJ, used for the WGS84 to UTM projection. sumolib is SUMO's
+# own pure Python helper library, used to locate the netconvert binary. SUMO
+# itself is a runtime dependency because netconvert is executed as a
+# subprocess; install the `sumo` extra to get it from PyPI instead of from a
+# host installation or a Docker image.
+dependencies = [
+    "pyproj>=3.6",
+    "sumolib>=1.26.0",
+]
+
+[project.optional-dependencies]
+# Pinned to the SUMO version the converter is validated against.
+sumo = ["eclipse-sumo==1.26.0"]
+
+[project.scripts]
+ll2sumo = "ll2sumo.convert:main"
+
+[tool.setuptools]
+packages = ["ll2sumo"]

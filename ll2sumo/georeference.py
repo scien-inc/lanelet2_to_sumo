@@ -3,14 +3,13 @@ from __future__ import annotations
 import math
 import xml.etree.ElementTree as ET
 from collections import Counter
+from functools import lru_cache
 from pathlib import Path
 from statistics import median
 
-from ll2sumo.model import GeoPoint, GeoReference, Point3D
+from pyproj import CRS, Transformer
 
-WGS84_A = 6378137.0
-WGS84_F = 1.0 / 298.257223563
-UTM_K0 = 0.9996
+from ll2sumo.model import GeoPoint, GeoReference, Point3D
 
 
 def utm_zone_for_lon(lon: float) -> int:
@@ -31,52 +30,49 @@ def utm_proj_parameter(zone: int, northern: bool) -> str:
     return " ".join(parts)
 
 
+@lru_cache(maxsize=None)
+def _utm_transformer(zone: int, northern: bool) -> Transformer:
+    """Return a cached WGS84 to UTM transformer.
+
+    Building a transformer is far more expensive than using one, and a map is
+    projected node by node, so the instances are cached per UTM frame.
+    """
+
+    return Transformer.from_crs(
+        "EPSG:4326",
+        CRS.from_proj4(utm_proj_parameter(zone, northern)),
+        always_xy=True,
+    )
+
+
+def _utm_frame(lat: float, lon: float, zone: int | None, northern: bool | None) -> tuple[int, bool]:
+    return zone or utm_zone_for_lon(lon), (lat >= 0.0) if northern is None else northern
+
+
 def project_wgs84_to_utm(
     lat: float,
     lon: float,
     zone: int | None = None,
     northern: bool | None = None,
 ) -> tuple[float, float]:
-    zone = zone or utm_zone_for_lon(lon)
-    northern = (lat >= 0.0) if northern is None else northern
-    false_northing = 0.0 if northern else 10000000.0
-
-    e2 = WGS84_F * (2.0 - WGS84_F)
-    ep2 = e2 / (1.0 - e2)
-    phi = math.radians(lat)
-    lam = math.radians(lon)
-    lam0 = math.radians((zone - 1) * 6 - 180 + 3)
-
-    sin_phi = math.sin(phi)
-    cos_phi = math.cos(phi)
-    tan_phi = math.tan(phi)
-    n = WGS84_A / math.sqrt(1.0 - e2 * sin_phi * sin_phi)
-    t = tan_phi * tan_phi
-    c = ep2 * cos_phi * cos_phi
-    a = cos_phi * (lam - lam0)
-    m = WGS84_A * (
-        (1.0 - e2 / 4.0 - 3.0 * e2**2 / 64.0 - 5.0 * e2**3 / 256.0) * phi
-        - (3.0 * e2 / 8.0 + 3.0 * e2**2 / 32.0 + 45.0 * e2**3 / 1024.0) * math.sin(2.0 * phi)
-        + (15.0 * e2**2 / 256.0 + 45.0 * e2**3 / 1024.0) * math.sin(4.0 * phi)
-        - (35.0 * e2**3 / 3072.0) * math.sin(6.0 * phi)
-    )
-
-    easting = UTM_K0 * n * (
-        a
-        + (1.0 - t + c) * a**3 / 6.0
-        + (5.0 - 18.0 * t + t * t + 72.0 * c - 58.0 * ep2) * a**5 / 120.0
-    ) + 500000.0
-    northing = UTM_K0 * (
-        m
-        + n
-        * tan_phi
-        * (
-            a * a / 2.0
-            + (5.0 - t + 9.0 * c + 4.0 * c * c) * a**4 / 24.0
-            + (61.0 - 58.0 * t + t * t + 600.0 * c - 330.0 * ep2) * a**6 / 720.0
-        )
-    ) + false_northing
+    easting, northing = _utm_transformer(*_utm_frame(lat, lon, zone, northern)).transform(lon, lat)
     return easting, northing
+
+
+def project_many_wgs84_to_utm(
+    coordinates: list[GeoPoint],
+    zone: int,
+    northern: bool,
+) -> tuple[list[float], list[float]]:
+    """Project a batch of points through one transformer call."""
+
+    if not coordinates:
+        return [], []
+    eastings, northings = _utm_transformer(zone, northern).transform(
+        [geo.lon for geo in coordinates],
+        [geo.lat for geo in coordinates],
+    )
+    return list(eastings), list(northings)
 
 
 def infer_geo_reference(
@@ -92,14 +88,13 @@ def infer_geo_reference(
     zone = zone_counts.most_common(1)[0][0]
     northern = sum(1 for node_id in usable_ids if node_geo[node_id].lat >= 0.0) >= len(usable_ids) / 2.0
 
-    offset_x_samples: list[float] = []
-    offset_y_samples: list[float] = []
-    for node_id in usable_ids:
-        geo = node_geo[node_id]
-        easting, northing = project_wgs84_to_utm(geo.lat, geo.lon, zone=zone, northern=northern)
-        point = nodes[node_id]
-        offset_x_samples.append(easting - point.x)
-        offset_y_samples.append(northing - point.y)
+    eastings, northings = project_many_wgs84_to_utm(
+        [node_geo[node_id] for node_id in usable_ids],
+        zone,
+        northern,
+    )
+    offset_x_samples = [easting - nodes[node_id].x for node_id, easting in zip(usable_ids, eastings)]
+    offset_y_samples = [northing - nodes[node_id].y for node_id, northing in zip(usable_ids, northings)]
 
     offset_x = _snap_offset(offset_x_samples)
     offset_y = _snap_offset(offset_y_samples)

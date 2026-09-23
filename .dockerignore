@@ -9,3 +9,7 @@ map/
 out/
 reference/
 trips.trips.xml
+.venv/
+build/
+dist/
+*.egg-info/

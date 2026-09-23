@@ -6,7 +6,14 @@ import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from ll2sumo.georeference import infer_geo_reference, patch_net_location, project_wgs84_to_utm
+from pyproj import Transformer
+
+from ll2sumo.georeference import (
+    infer_geo_reference,
+    patch_net_location,
+    project_many_wgs84_to_utm,
+    project_wgs84_to_utm,
+)
 from ll2sumo.model import GeoPoint, Point3D
 from ll2sumo.parser import parse_lanelet_map
 
@@ -17,6 +24,34 @@ class UTMProjectionTest(unittest.TestCase):
 
         self.assertAlmostEqual(easting, 389376.6261, places=3)
         self.assertAlmostEqual(northing, 3942842.2608, places=3)
+
+    def test_matches_the_epsg_utm_definitions(self) -> None:
+        # Checks the zone, hemisphere and proj string this module builds against
+        # the authoritative EPSG definitions, in both hemispheres.
+        for lat, lon, epsg in [
+            (35.62318359651, 139.77840697094, "EPSG:32654"),
+            (-33.868820, 151.209290, "EPSG:32756"),
+        ]:
+            with self.subTest(epsg=epsg):
+                expected = Transformer.from_crs("EPSG:4326", epsg, always_xy=True).transform(lon, lat)
+
+                self.assertEqual(project_wgs84_to_utm(lat, lon), expected)
+
+    def test_batch_projection_matches_scalar_projection(self) -> None:
+        points = [
+            GeoPoint(lat=35.62318359651, lon=139.77840697094),
+            GeoPoint(lat=35.62315463909, lon=139.77840658327),
+            GeoPoint(lat=35.681236, lon=139.767125),
+        ]
+
+        eastings, northings = project_many_wgs84_to_utm(points, 54, True)
+
+        for geo, easting, northing in zip(points, eastings, northings):
+            expected = project_wgs84_to_utm(geo.lat, geo.lon, zone=54, northern=True)
+            self.assertEqual((easting, northing), expected)
+
+    def test_batch_projection_of_nothing(self) -> None:
+        self.assertEqual(project_many_wgs84_to_utm([], 54, True), ([], []))
 
 
 class GeoReferenceInferenceTest(unittest.TestCase):
