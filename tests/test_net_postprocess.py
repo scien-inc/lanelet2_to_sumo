@@ -215,6 +215,88 @@ class NetPostprocessTest(unittest.TestCase):
             self.assertEqual(self._shape_xy(path, ":y_0"), [(3, 0.2), (4, 0.1), (5, 0)])
             self.assertNotIn("shape", ET.parse(path).getroot().findall("connection")[-1].attrib)
 
+    def _write_split_reflection_fixture(self, directory, source_sign=1, via_sign=-1, error=(0, 0)):
+        path, connections = Path(directory) / "net.xml", Path(directory) / "connections.xml"
+        root = ET.Element("net")
+        shapes = {
+            "a_0": f"0,{9 * source_sign},4 1,{10 * source_sign},4",
+            "a_1": f"0,{9 * source_sign},4 1,{10 * source_sign},4",
+            "b_0": f"5,{14 * source_sign},4 6,{15 * source_sign},4",
+            ":x_0": f"1,{10 * via_sign},4 3,{12 * via_sign + error[0]},{4 + error[1]}",
+            ":y_0": f"3,{12 * via_sign + error[0]},{4 + error[1]} 5,{14 * via_sign},4",
+            ":z_0": f"1,{10 * via_sign},4 5,{14 * via_sign},4",
+        }
+        for lane_id, shape in shapes.items():
+            edge_id, index = lane_id.rsplit("_", 1)
+            edge = root.find(f"edge[@id='{edge_id}']")
+            if edge is None:
+                edge = ET.SubElement(root, "edge", id=edge_id)
+            ET.SubElement(edge, "lane", id=lane_id, index=index, shape=shape)
+        plain = ET.Element("connections")
+        for lane, via in (("0", ":x_0"), ("1", ":z_0")):
+            attrs = dict(fromLane=lane, toLane="0", to="b", **{"from": "a"})
+            shape = f"1,{10 * source_sign},4 3,{12 * source_sign},4 5,{14 * source_sign},4"
+            net_shape = f"1,{10 * via_sign},4 3,{12 * via_sign},4 5,{14 * via_sign},4"
+            ET.SubElement(root, "connection", **attrs, via=via, shape=net_shape)
+            ET.SubElement(plain, "connection", **attrs, shape=shape)
+        for edge, via in ((":x", ":y_0"), (":y", None), (":z", None)):
+            link = ET.SubElement(root, "connection", **{"from": edge}, fromLane="0", to="b", toLane="0")
+            if via:
+                link.set("via", via)
+        ET.ElementTree(root).write(path)
+        ET.ElementTree(plain).write(connections)
+        return path, connections
+
+    def test_source_verified_y_reflection_restores_split_and_shared_successor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            for source_sign, via_sign, corrected in ((1, -1, 3), (-1, 1, 3), (-1, -1, 0)):
+                with self.subTest(source_sign=source_sign, via_sign=via_sign):
+                    path, connections = self._write_split_reflection_fixture(directory, source_sign, via_sign)
+                    summary = _align_internal_connection_shapes_to_net_lanes(path, connections)
+                    self.assertEqual(summary["aligned_connection_count"], 2)
+                    self.assertEqual(summary["unrepaired_connection_count"], 0)
+                    self.assertEqual(summary["corrected_y_reflection_lane_count"], corrected)
+                    self.assertEqual(self._shape_xy(path, ":x_0"), [(1, 10 * source_sign), (3, 12 * source_sign)])
+                    self.assertEqual(self._shape_xy(path, ":y_0"), [(3, 12 * source_sign), (5, 14 * source_sign)])
+                    self.assertEqual(self._shape_xy(path, ":z_0"), [(1, 10 * source_sign), (3, 12 * source_sign), (5, 14 * source_sign)])
+                    self.assertEqual(_audit_degenerate_internal_lane_shapes(path)["discontinuities"], [])
+                    once = path.read_bytes()
+                    summary = _align_internal_connection_shapes_to_net_lanes(path, connections)
+                    self.assertEqual(summary["corrected_y_reflection_lane_count"], 0)
+                    self.assertEqual(path.read_bytes(), once)
+
+    def test_reflection_requires_matching_source_curve_and_height(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            for error, provide_source, reverse in (
+                ((0.02, 0), True, False), ((0, 0.02), True, False),
+                ((0, 0), False, False), ((0, 0), True, True),
+            ):
+                with self.subTest(error=error, provide_source=provide_source, reverse=reverse):
+                    path, connections = self._write_split_reflection_fixture(directory, error=error)
+                    tree = ET.parse(path)
+                    tree.getroot().find(".//lane[@id=':z_0']").set("shape", "1,10,4 5,14,4")
+                    if reverse:
+                        first = tree.getroot().find(".//lane[@id=':x_0']")
+                        first.set("shape", " ".join(reversed(first.get("shape").split())))
+                    tree.write(path)
+                    before = [(e.tag, dict(e.attrib)) for e in tree.getroot().iter()]
+                    summary = _align_internal_connection_shapes_to_net_lanes(path, connections if provide_source else None)
+                    self.assertEqual(summary["corrected_y_reflection_lane_count"], 0)
+                    self.assertEqual(summary["unrepaired_connection_count"], 2)
+                    self.assertEqual([(e.tag, e.attrib) for e in ET.parse(path).getroot().iter()], before)
+
+    def test_verified_reflection_survives_unrelated_successor_group_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path, connections = self._write_split_reflection_fixture(directory, error=(0, 0.02))
+            before = self._shape_xy(path, ":x_0")
+            summary = _align_internal_connection_shapes_to_net_lanes(path, connections)
+            self.assertEqual(summary["unrepaired_connection_count"], 2)
+            self.assertEqual(summary["corrected_y_reflection_lane_count"], 1)
+            self.assertEqual(self._shape_xy(path, ":x_0"), before)
+            self.assertEqual(self._shape_xy(path, ":z_0"), [(1, 10), (5, 14)])
+            owner = ET.parse(path).getroot().find("connection[@fromLane='1']")
+            self.assertEqual(owner.get("shape"), "1.000,10.000,4.000 3.000,12.000,4.000 5.000,14.000,4.000")
+
     def test_shared_successor_stub_follows_slope_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "net.xml"
