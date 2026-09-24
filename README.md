@@ -332,8 +332,11 @@ connectivity_summary
 Normal lane geometry is restored from the Lanelet2-derived plain XML before
 connection geometry is aligned. Short junction stubs use the first 0.25 m of the
 successor centerline and trim that same interval from the successor. Split via
-chains retain separate lane shapes. Unresolvable successor groups retain their
-existing connection geometry and adjoining endpoints; their IDs and reasons are
+chains retain separate lane shapes. Y reflections are corrected when the source
+curve verifies their position, height, and order, before split positions are
+projected. The count is reported as `corrected_y_reflection_lane_count` under
+`internal_connection_shape_align`. Unresolvable successor groups retain this
+verified geometry and their adjoining endpoints; their IDs and reasons are
 reported. Geometry and lengths may therefore differ from earlier output, and
 existing routes should be revalidated against a regenerated network.
 

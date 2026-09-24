@@ -343,6 +343,29 @@ def _internal_lane_chain(owner: ET.Element, outgoing: dict[str, list[ET.Element]
     return lanes, links
 
 
+def _source_aligned_internal_shapes(
+    shapes: list[tuple[Point3D, ...]], reference: tuple[Point3D, ...],
+) -> list[tuple[Point3D, ...]]:
+    """Resolve netconvert's Y reflection using the source curve, not Y's sign.
+
+    Verify every vertex, height, and projection order before correcting the
+    coordinate frame; a failed alignment may safely retain this source geometry.
+    """
+    if len(reference) < 2 or any(len(shape) < 2 for shape in shapes):
+        return shapes
+    for reflect in (False, True):
+        candidate = [tuple(Point3D(p.x, -p.y, p.z) for p in shape) for shape in shapes] if reflect else shapes
+        points = [point for shape in candidate for point in shape]
+        projections = [_project_point_on_polyline(reference, point) for point in points]
+        if all(projection is not None and projection[0] <= 0.001
+               and abs(point.z - projection[2].z) <= 0.001
+               for point, projection in zip(points, projections)) and all(
+            after[1] >= before[1] - 1e-9 for before, after in zip(projections, projections[1:])
+        ):
+            return candidate
+    return shapes
+
+
 def _align_internal_connection_shapes_to_net_lanes(
     net_path: str | Path,
     plain_connections_path: str | Path | None = None,
@@ -350,9 +373,9 @@ def _align_internal_connection_shapes_to_net_lanes(
 ) -> dict[str, object]:
     """Restore source curves and allocate junction stubs once per successor.
 
-    Proposals are checked before writing. If a movement cannot be reconstructed,
-    keep its successor group and adjoining endpoints unchanged, then recompute
-    the remaining proposals against those retained endpoints.
+    Correct source-verified Y reflections before testing alignment proposals.
+    If a movement cannot be reconstructed, keep its corrected successor group
+    and adjoining endpoints, then recompute the remaining proposals.
     """
     path = Path(net_path)
     tree = ET.parse(path)
@@ -384,6 +407,21 @@ def _align_internal_connection_shapes_to_net_lanes(
     for index, (chain, _) in enumerate(chains):
         for via in chain or [owners[index].get("via")]:
             owners_by_via[via].append(index)
+    reflected: dict[str, tuple[Point3D, ...]] = {}
+    for index, (chain, links) in enumerate(chains):
+        if not chain or any(via not in original or len(owners_by_via[via]) != 1 for via in chain):
+            continue
+        reference = plain.get(keys[index], ())
+        shapes = _source_aligned_internal_shapes([original[via] for via in chain], reference)
+        corrections = {via: shape for via, shape in zip(chain, shapes) if shape != original[via]}
+        if corrections:
+            reflected.update(corrections)
+            for connection in [owners[index], *links]:
+                shape = _parse_shape_points(connection.get("shape", ""))
+                corrected = _source_aligned_internal_shapes([shape], reference)[0]
+                if corrected != shape:
+                    connection.set("shape", _shape_string(corrected))
+    internal_shapes = {**original, **reflected}
     from_ids = [_net_lane_id(key[0], key[2]) for key in keys]
     to_ids = [_net_lane_id(key[1], key[3]) for key in keys]
     groups: dict[str, list[int]] = defaultdict(list)
@@ -470,11 +508,12 @@ def _align_internal_connection_shapes_to_net_lanes(
             if _max_shape_turn((*entry, *points, *exit_segment)) > 45.0 + 1e-6:
                 problems[index] = "heading_change_exceeds_limit"
                 continue
+            split_shapes = [internal_shapes[lane_id] for lane_id in chain]
             cuts = [(0.0, points[0])]
-            for before, after in zip(chain, chain[1:]):
-                if not original[before] or not original[after]:
+            for before, after in zip(split_shapes, split_shapes[1:]):
+                if not before or not after:
                     break
-                boundary = _interpolate_point(original[before][-1], original[after][0], 0.5)
+                boundary = _interpolate_point(before[-1], after[0], 0.5)
                 projection = _project_point_on_polyline(points, boundary)
                 if projection is None or projection[1] <= cuts[-1][0] + 0.01:
                     break
@@ -519,7 +558,7 @@ def _align_internal_connection_shapes_to_net_lanes(
                         problems.setdefault(other, "shared_ambiguous_via")
         # Each pass excludes at least one additional movement, so this converges.
 
-    replacements = dict(normal)
+    replacements = {**reflected, **normal}
     for index, (points, pieces) in proposals.items():
         owner = owners[index]
         owner.set("shape", _shape_string(points))
@@ -554,6 +593,7 @@ def _align_internal_connection_shapes_to_net_lanes(
         "repaired_degenerate_internal_lane_count": repaired_degenerate,
         "allocated_successor_stub_count": len(prefixes),
         "split_connection_count": sum(len(chains[i][0]) > 1 for i in proposals),
+        "corrected_y_reflection_lane_count": len(reflected),
         "unrepaired_connection_count": len(failures),
         "unrepaired_connections": unresolved,
         "reason_counts": dict(Counter(failures.values())),
