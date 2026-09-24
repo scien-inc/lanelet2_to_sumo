@@ -39,7 +39,6 @@ from ll2sumo.signal_mapping import (
     _signal_mapping_record,
     _signal_mapping_record_sort_key,
     _write_signal_id_mapping_json,
-    _write_tls_linksignal_params,
 )
 from ll2sumo.sumo_xml import (
     id_sort_key as _sort_key,
@@ -2192,15 +2191,11 @@ def convert_map(
     signal_mode: str = "jp-static",
     run_netconvert: bool = True,
     netconvert_binary: str | None = None,
-    opendrive_lanelet_mapping: str | Path | None = None,
 ) -> dict[str, object]:
     if lane_change_mode not in {"lanelet-infer", "unrestricted"}:
         raise ValueError(f"Unsupported lane change mode: {lane_change_mode}")
     if signal_mode not in {"none", "jp-static"}:
         raise ValueError(f"Unsupported signal mode: {signal_mode}")
-
-    if opendrive_lanelet_mapping is not None and (signal_mode == "none" or not run_netconvert):
-        raise ValueError("OpenDRIVE signal mapping requires --signal-mode jp-static and netconvert")
 
     netconvert_binary = _resolve_netconvert_binary(netconvert_binary)
 
@@ -2389,7 +2384,6 @@ def convert_map(
     joined_connection_patch_result: subprocess.CompletedProcess[str] | None = None
     internal_connection_shape_align_summary: dict[str, object] | None = None
     internal_shape_audit_summary: dict[str, object] | None = None
-    tls_linksignal_summary: dict[str, object] | None = None
     connectivity_summary: dict[str, object] | None = None
     if run_netconvert:
         build_tls_from_nodes = signal_mode == "jp-static" and bool(tls_ids_by_node_id)
@@ -2456,10 +2450,6 @@ def convert_map(
             signal_link_mapping_records,
             net_path if run_netconvert else None,
         )
-        if opendrive_lanelet_mapping is not None:
-            tls_linksignal_summary = _write_tls_linksignal_params(
-                net_path, signal_id_mapping_path, opendrive_lanelet_mapping,
-            )
     elif signal_id_mapping_path.exists():
         signal_id_mapping_path.unlink()
 
@@ -2589,11 +2579,7 @@ def convert_map(
         report["connectivity_summary"] = connectivity_summary
     if tls_phase_patch_summary is not None:
         report["tls_phase_patch"] = tls_phase_patch_summary
-    if tls_linksignal_summary is not None:
-        report["tls_linksignal"] = tls_linksignal_summary
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
-    if tls_linksignal_summary is not None and tls_linksignal_summary["errors"]:
-        raise RuntimeError(f"Invalid TLS mapping: {tls_linksignal_summary['errors']}. See {report_path}")
 
     return {
         "nodes_path": str(nodes_path),
@@ -2635,10 +2621,6 @@ def main() -> None:
             "NETCONVERT_BINARY, then SUMO_HOME, then the installed eclipse-sumo wheel, then PATH."
         ),
     )
-    parser.add_argument(
-        "--opendrive-lanelet-mapping",
-        help="Lanelet2/OpenDRIVE mapping JSON; adds linkSignalID params for signal synchronization.",
-    )
     args = parser.parse_args()
 
     result = convert_map(
@@ -2648,7 +2630,6 @@ def main() -> None:
         signal_mode=args.signal_mode,
         run_netconvert=not args.skip_netconvert,
         netconvert_binary=args.netconvert_binary,
-        opendrive_lanelet_mapping=args.opendrive_lanelet_mapping,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 
