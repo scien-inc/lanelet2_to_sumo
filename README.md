@@ -292,7 +292,7 @@ Main options:
 - TLS phase patch summary
 - lane length vs shape patch summary
 - internal lane shape audit
-- internal lane repair summary
+- source geometry restoration and unresolved connection reasons
 - connection shape summary
 - connectivity summary
 
@@ -300,10 +300,23 @@ Check these fields first when validating a generated network:
 
 ```text
 internal_shape_audit.degenerate_internal_lane_count
-internal_shape_repair.repaired_internal_lane_count
+internal_connection_shape_align.repaired_internal_lane_count
+internal_connection_shape_align.unrepaired_connections
+internal_shape_audit.discontinuity_counts
 connection_shape_summary.unshaped_connection_count
 connectivity_summary
 ```
+
+Normal lane geometry is restored from the Lanelet2-derived plain XML before
+connection geometry is aligned. Short junction stubs use the first 0.25 m of the
+successor centerline and trim that same interval from the successor. Split via
+chains retain separate lane shapes. Y reflections are corrected when the source
+curve verifies their position, height, and order, before split positions are
+projected. The count is reported as `corrected_y_reflection_lane_count` under
+`internal_connection_shape_align`. Unresolvable successor groups retain this
+verified geometry and their adjoining endpoints; their IDs and reasons are
+reported. Geometry and lengths may therefore differ from earlier output, and
+existing routes should be revalidated against a regenerated network.
 
 ## Docker
 

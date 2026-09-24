@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import math
 import xml.etree.ElementTree as ET
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
 from ll2sumo.geometry import distance_2d, heading_deg, polyline_length
 from ll2sumo.geometry import first_nonzero_segment as _first_nonzero_segment
 from ll2sumo.geometry import last_nonzero_segment as _last_nonzero_segment
-from ll2sumo.geometry import point_along_direction as _point_along_direction
 from ll2sumo.model import Point3D
 from ll2sumo.sumo_xml import id_sort_key as _sort_key
 from ll2sumo.sumo_xml import is_internal_edge as _is_internal_edge
@@ -20,7 +19,7 @@ from ll2sumo.sumo_xml import shape_string as _shape_string
 from ll2sumo.sumo_xml import usable_connection_shape as _usable_connection_shape
 
 MIN_SUMO_LANE_LENGTH_M, DEGENERATE_INTERNAL_LANE_XY_LENGTH_M = 0.1, 0.01
-REPAIRED_INTERNAL_LANE_FALLBACK_LENGTH_M, MAX_INTERNAL_CONNECTION_ALIGN_EXAMPLES = 0.25, 20
+REPAIRED_INTERNAL_LANE_FALLBACK_LENGTH_M = 0.25
 MAX_JOINED_UNMAPPED_CONNECTION_EXAMPLES = 20
 JP_TLS_GREEN_TIME_S, JP_TLS_YELLOW_TIME_S, JP_TLS_ALL_RED_TIME_S = 35, 3, 2
 JP_TLS_AXIS_CLUSTER_THRESHOLD_DEG = 35.0
@@ -64,40 +63,6 @@ def _summarize_net_tls(net_path: Path) -> dict[str, object]:
         "sumo_tls_ids": tls_ids,
     }
 
-def _replacement_internal_shape(
-    from_points: tuple[Point3D, ...],
-    to_points: tuple[Point3D, ...],
-) -> tuple[Point3D, Point3D] | None:
-    if not from_points or not to_points:
-        return None
-    start = from_points[-1]
-    end = to_points[0]
-    if distance_2d(start, end) >= DEGENERATE_INTERNAL_LANE_XY_LENGTH_M:
-        return start, end
-
-    downstream_segment = _first_nonzero_segment(to_points, DEGENERATE_INTERNAL_LANE_XY_LENGTH_M)
-    if downstream_segment is not None:
-        fallback_end = _point_along_direction(
-            start,
-            downstream_segment[0],
-            downstream_segment[1],
-            REPAIRED_INTERNAL_LANE_FALLBACK_LENGTH_M,
-        )
-        if fallback_end is not None:
-            return start, fallback_end
-
-    incoming_segment = _last_nonzero_segment(from_points, DEGENERATE_INTERNAL_LANE_XY_LENGTH_M)
-    if incoming_segment is not None:
-        fallback_end = _point_along_direction(
-            start,
-            incoming_segment[0],
-            incoming_segment[1],
-            REPAIRED_INTERNAL_LANE_FALLBACK_LENGTH_M,
-        )
-        if fallback_end is not None:
-            return start, fallback_end
-    return None
-
 def _interpolate_point(start: Point3D, end: Point3D, ratio: float) -> Point3D:
     return Point3D(
         x=start.x + (end.x - start.x) * ratio,
@@ -111,6 +76,7 @@ def _project_point_on_polyline(points: tuple[Point3D, ...], point: Point3D) -> t
     best_distance = math.inf
     best_along = 0.0
     best_point: Point3D | None = None
+    ambiguous = False
     along_before = 0.0
     for start, end in zip(points, points[1:]):
         segment_length = distance_2d(start, end)
@@ -123,12 +89,15 @@ def _project_point_on_polyline(points: tuple[Point3D, ...], point: Point3D) -> t
         projected = _interpolate_point(start, end, ratio)
         projected_distance = distance_2d(point, projected)
         projected_along = along_before + segment_length * ratio
-        if projected_distance < best_distance:
+        if abs(projected_distance - best_distance) <= 1e-9 and abs(projected_along - best_along) > 0.01:
+            ambiguous = True
+        if projected_distance < best_distance - 1e-9:
+            ambiguous = False
             best_distance = projected_distance
             best_along = projected_along
             best_point = projected
         along_before += segment_length
-    if best_point is None:
+    if best_point is None or ambiguous:
         return None
     return best_distance, best_along, best_point
 
@@ -150,78 +119,11 @@ def _slice_polyline_between(
         along += segment_length
         if start_along + DEGENERATE_INTERNAL_LANE_XY_LENGTH_M < along < end_along - DEGENERATE_INTERNAL_LANE_XY_LENGTH_M:
             sliced.append(end)
-    sliced.append(end_point)
+    if len(sliced) > 1 and distance_2d(sliced[-1], end_point) < 0.01:
+        sliced[-1] = end_point
+    else:
+        sliced.append(end_point)
     return _usable_connection_shape(sliced)
-
-def _aligned_internal_connection_shape(
-    connection_points: tuple[Point3D, ...],
-    from_points: tuple[Point3D, ...],
-    to_points: tuple[Point3D, ...],
-) -> tuple[tuple[Point3D, ...], str] | None:
-    if not from_points or not to_points:
-        return None
-    start = from_points[-1]
-    end = to_points[0]
-    if distance_2d(start, end) < REPAIRED_INTERNAL_LANE_FALLBACK_LENGTH_M:
-        downstream_segment = _first_nonzero_segment(to_points, DEGENERATE_INTERNAL_LANE_XY_LENGTH_M)
-        if downstream_segment is not None:
-            fallback_end = _point_along_direction(
-                start,
-                downstream_segment[0],
-                downstream_segment[1],
-                REPAIRED_INTERNAL_LANE_FALLBACK_LENGTH_M,
-            )
-            if fallback_end is not None:
-                fallback_shape = _usable_connection_shape((start, fallback_end))
-                if fallback_shape is not None:
-                    return fallback_shape, "tangent_fallback"
-        if distance_2d(start, end) >= DEGENERATE_INTERNAL_LANE_XY_LENGTH_M:
-            fallback_end = _point_along_direction(
-                start,
-                start,
-                end,
-                REPAIRED_INTERNAL_LANE_FALLBACK_LENGTH_M,
-            )
-            if fallback_end is not None:
-                fallback_shape = _usable_connection_shape((start, fallback_end))
-                if fallback_shape is not None:
-                    return fallback_shape, "direct_fallback"
-
-    if len(connection_points) >= 2:
-        start_projection = _project_point_on_polyline(connection_points, start)
-        end_projection = _project_point_on_polyline(connection_points, end)
-        if start_projection is not None and end_projection is not None:
-            _, start_along, _ = start_projection
-            _, end_along, _ = end_projection
-            sliced_shape = _slice_polyline_between(connection_points, start_along, start, end_along, end)
-            if sliced_shape is not None:
-                return sliced_shape, "trimmed"
-
-    direct_shape = _usable_connection_shape((start, end))
-    if direct_shape is not None:
-        return direct_shape, "direct_fallback"
-
-    fallback_shape = _replacement_internal_shape(from_points, to_points)
-    if fallback_shape is None:
-        return None
-    usable_fallback_shape = _usable_connection_shape(fallback_shape)
-    if usable_fallback_shape is None:
-        return None
-    return usable_fallback_shape, "tangent_fallback"
-
-def _joined_intersection_connection_shape(
-    connection_points: tuple[Point3D, ...],
-    from_points: tuple[Point3D, ...],
-    to_points: tuple[Point3D, ...],
-) -> tuple[tuple[Point3D, ...], str] | None:
-    if len(connection_points) < 2 or not from_points or not to_points:
-        return None
-    start = from_points[-1]
-    end = to_points[0]
-    usable_shape = _usable_connection_shape((start, *connection_points, end))
-    if usable_shape is None:
-        return None
-    return usable_shape, "joined_preserved"
 
 def _audit_degenerate_internal_lane_shapes(net_path: str | Path) -> dict[str, object]:
     root = ET.parse(net_path).getroot()
@@ -247,70 +149,37 @@ def _audit_degenerate_internal_lane_shapes(net_path: str | Path) -> dict[str, ob
                         "shape": lane_element.attrib.get("shape"),
                     }
                 )
+    lane_shapes = {
+        lane.attrib["id"]: _parse_shape_points(lane.get("shape", ""))
+        for edge in root.findall("edge") for lane in edge.findall("lane")
+    }
+    discontinuities = []
+    for lane_id, points in lane_shapes.items():
+        turn = _max_shape_turn(points)
+        if turn > 45.0:
+            discontinuities.append({"lane_id": lane_id, "reason": "lane_shape_turn", "angle_deg": round(turn, 6)})
+    for connection in root.findall("connection"):
+        key = _connection_key(connection)
+        if key is None:
+            continue
+        from_id = _net_lane_id(key[0], key[2])
+        to_id = connection.get("via") or _net_lane_id(key[1], key[3])
+        incoming, outgoing = lane_shapes.get(from_id, ()), lane_shapes.get(to_id, ())
+        if not incoming or not outgoing:
+            continue
+        gap = distance_2d(incoming[-1], outgoing[0])
+        dz = abs(incoming[-1].z - outgoing[0].z)
+        if gap > 0.001 or dz > 0.001:
+            discontinuities.append({"from_lane": from_id, "to_lane": to_id, "reason": "endpoint_gap", "gap_m": round(gap, 6), "z_gap_m": round(dz, 6)})
+        turn = _max_shape_turn((*incoming[-2:], *outgoing[:2]))
+        if turn > 45.0:
+            discontinuities.append({"from_lane": from_id, "to_lane": to_id, "reason": "connection_boundary_turn", "angle_deg": round(turn, 6)})
     return {
         "scanned_internal_lane_count": scanned_count,
         "degenerate_internal_lane_count": degenerate_count,
         "examples": examples,
-    }
-
-def _sync_internal_lane_shapes_from_connection_shapes(net_path: str | Path) -> dict[str, object]:
-    path = Path(net_path)
-    tree = ET.parse(path)
-    root = tree.getroot()
-    lanes_by_id: dict[str, ET.Element] = {
-        lane_element.attrib["id"]: lane_element
-        for edge_element in root.findall("edge")
-        for lane_element in edge_element.findall("lane")
-        if "id" in lane_element.attrib
-    }
-    scanned_via_count = 0
-    synced_count = 0
-    missing_shape_count = 0
-    unusable_shape_count = 0
-    examples: list[dict[str, object]] = []
-
-    for connection_element in root.findall("connection"):
-        via_lane_id = connection_element.attrib.get("via")
-        if not via_lane_id:
-            continue
-        lane_element = lanes_by_id.get(via_lane_id)
-        if lane_element is None:
-            continue
-        scanned_via_count += 1
-        connection_shape = connection_element.attrib.get("shape")
-        if not connection_shape:
-            missing_shape_count += 1
-            continue
-        connection_points = _parse_shape_points(connection_shape)
-        usable_shape = _usable_connection_shape(connection_points)
-        if usable_shape is None:
-            unusable_shape_count += 1
-            continue
-        replacement_shape = _shape_string(usable_shape)
-        if lane_element.attrib.get("shape") == replacement_shape:
-            continue
-        lane_element.set("shape", replacement_shape)
-        synced_count += 1
-        if len(examples) < 20:
-            examples.append(
-                {
-                    "lane_id": via_lane_id,
-                    "from": connection_element.attrib.get("from"),
-                    "to": connection_element.attrib.get("to"),
-                    "xy_length_m": round(_polyline_length_2d(usable_shape), 6),
-                }
-            )
-
-    if synced_count:
-        ET.indent(tree, space="    ")
-        tree.write(path, encoding="utf-8", xml_declaration=True)
-
-    return {
-        "scanned_via_connection_count": scanned_via_count,
-        "synced_internal_lane_count": synced_count,
-        "missing_connection_shape_count": missing_shape_count,
-        "unusable_connection_shape_count": unusable_shape_count,
-        "examples": examples,
+        "discontinuity_counts": dict(Counter(item["reason"] for item in discontinuities)),
+        "discontinuities": discontinuities,
     }
 
 def _plain_connection_shapes(connections_path: str | Path | None) -> dict[tuple[str, str, str, str], tuple[Point3D, ...]]:
@@ -433,250 +302,307 @@ def _write_joined_unmapped_connection_deletions(
         "examples": _joined_unmapped_connection_examples(keys),
     }
 
+def _split_shape_at(points: tuple[Point3D, ...], along: float) -> tuple[tuple[Point3D, ...], tuple[Point3D, ...]] | None:
+    total = _polyline_length_2d(points)
+    if not 0.01 < along < total - 0.01:
+        return None
+    distance = 0.0
+    for first, second in zip(points, points[1:]):
+        length = distance_2d(first, second)
+        if length and distance + length >= along:
+            point = _interpolate_point(first, second, (along - distance) / length)
+            before = _slice_polyline_between(points, 0.0, points[0], along, point)
+            after = _slice_polyline_between(points, along, point, total, points[-1])
+            return (before, after) if before and after else None
+        distance += length
+    return None
+
+
+def _max_shape_turn(points: tuple[Point3D, ...]) -> float:
+    headings = [heading_deg(a, b) for a, b in zip(points, points[1:]) if distance_2d(a, b) >= 0.01]
+    return max((abs((b - a + 180.0) % 360.0 - 180.0) for a, b in zip(headings, headings[1:])), default=0.0)
+
+
+def _internal_lane_chain(owner: ET.Element, outgoing: dict[str, list[ET.Element]]) -> tuple[list[str], list[ET.Element]]:
+    """Follow actual via links; an owner shape may span several internal lanes."""
+    lanes: list[str] = []
+    links: list[ET.Element] = []
+    via = owner.get("via")
+    while via:
+        if via in lanes:
+            return [], []
+        lanes.append(via)
+        downstream = outgoing.get(via, [])
+        if len(downstream) != 1:
+            return [], []
+        link = downstream[0]
+        if (link.get("to"), link.get("toLane")) != (owner.get("to"), owner.get("toLane")):
+            return [], []
+        links.append(link)
+        via = link.get("via")
+    return lanes, links
+
+
+def _source_aligned_internal_shapes(
+    shapes: list[tuple[Point3D, ...]], reference: tuple[Point3D, ...],
+) -> list[tuple[Point3D, ...]]:
+    """Resolve netconvert's Y reflection using the source curve, not Y's sign.
+
+    Verify every vertex, height, and projection order before correcting the
+    coordinate frame; a failed alignment may safely retain this source geometry.
+    """
+    if len(reference) < 2 or any(len(shape) < 2 for shape in shapes):
+        return shapes
+    for reflect in (False, True):
+        candidate = [tuple(Point3D(p.x, -p.y, p.z) for p in shape) for shape in shapes] if reflect else shapes
+        points = [point for shape in candidate for point in shape]
+        projections = [_project_point_on_polyline(reference, point) for point in points]
+        if all(projection is not None and projection[0] <= 0.001
+               and abs(point.z - projection[2].z) <= 0.001
+               for point, projection in zip(points, projections)) and all(
+            after[1] >= before[1] - 1e-9 for before, after in zip(projections, projections[1:])
+        ):
+            return candidate
+    return shapes
+
+
 def _align_internal_connection_shapes_to_net_lanes(
     net_path: str | Path,
     plain_connections_path: str | Path | None = None,
+    plain_edges_path: str | Path | None = None,
 ) -> dict[str, object]:
+    """Restore source curves and allocate junction stubs once per successor.
+
+    Correct source-verified Y reflections before testing alignment proposals.
+    If a movement cannot be reconstructed, keep its corrected successor group
+    and adjoining endpoints, then recompute the remaining proposals.
+    """
     path = Path(net_path)
     tree = ET.parse(path)
     root = tree.getroot()
-    plain_connection_shapes = _plain_connection_shapes(plain_connections_path)
-    lanes_by_id: dict[str, ET.Element] = {
-        lane_element.attrib["id"]: lane_element
-        for edge_element in root.findall("edge")
-        for lane_element in edge_element.findall("lane")
-        if "id" in lane_element.attrib
-    }
-    scanned_count = 0
-    aligned_count = 0
-    trimmed_count = 0
-    direct_fallback_count = 0
-    tangent_fallback_count = 0
-    preserved_joined_count = 0
-    fallback_joined_count = 0
-    plain_joined_shape_count = 0
-    unrepaired_count = 0
-    max_endpoint_gap_before = 0.0
-    max_endpoint_gap_after = 0.0
-    max_joined_endpoint_gap_after = 0.0
-    examples: list[dict[str, object]] = []
-
-    for connection_element in root.findall("connection"):
-        from_edge_id = connection_element.attrib.get("from")
-        to_edge_id = connection_element.attrib.get("to")
-        from_lane_index = connection_element.attrib.get("fromLane")
-        to_lane_index = connection_element.attrib.get("toLane")
-        if from_edge_id is None or to_edge_id is None or from_lane_index is None or to_lane_index is None:
+    lanes = {lane.attrib["id"]: lane for edge in root.findall("edge") for lane in edge.findall("lane")}
+    original = {key: _parse_shape_points(lane.get("shape", "")) for key, lane in lanes.items()}
+    normal_ids = {lane.attrib["id"] for edge in root.findall("edge") if not _is_internal_edge(edge) for lane in edge.findall("lane")}
+    source = {key: original[key] for key in normal_ids}
+    if plain_edges_path is not None:
+        for edge in ET.parse(plain_edges_path).getroot().findall("edge"):
+            for lane in edge.findall("lane"):
+                key = _net_lane_id(edge.attrib["id"], lane.attrib["index"])
+                if key in normal_ids:
+                    source[key] = _parse_shape_points(lane.get("shape", ""))
+    plain = _plain_connection_shapes(plain_connections_path)
+    outgoing: dict[str, list[ET.Element]] = defaultdict(list)
+    owners: list[ET.Element] = []
+    for connection in root.findall("connection"):
+        key = _connection_key(connection)
+        if key is None:
             continue
-        from_lane_element = lanes_by_id.get(_net_lane_id(from_edge_id, from_lane_index))
-        to_lane_element = lanes_by_id.get(_net_lane_id(to_edge_id, to_lane_index))
-        if from_lane_element is None or to_lane_element is None:
+        outgoing[_net_lane_id(key[0], key[2])].append(connection)
+        if key[0].startswith(":") or key[1].startswith(":") or not connection.get("via"):
             continue
-        from_points = _parse_shape_points(from_lane_element.attrib.get("shape", ""))
-        to_points = _parse_shape_points(to_lane_element.attrib.get("shape", ""))
-        if not from_points or not to_points:
+        owners.append(connection)
+    keys = [_connection_key(owner) for owner in owners]
+    chains = [_internal_lane_chain(owner, outgoing) for owner in owners]
+    owners_by_via: dict[str, list[int]] = defaultdict(list)
+    for index, (chain, _) in enumerate(chains):
+        for via in chain or [owners[index].get("via")]:
+            owners_by_via[via].append(index)
+    reflected: dict[str, tuple[Point3D, ...]] = {}
+    for index, (chain, links) in enumerate(chains):
+        if not chain or any(via not in original or len(owners_by_via[via]) != 1 for via in chain):
             continue
-        scanned_count += 1
-        via_lane_id = connection_element.attrib.get("via")
-        is_joined_intersection_connection = bool(via_lane_id and via_lane_id.startswith(":ia_"))
-        plain_connection_points = plain_connection_shapes.get(
-            (
-                from_edge_id,
-                to_edge_id,
-                from_lane_index,
-                to_lane_index,
-            )
-        )
-        if is_joined_intersection_connection and plain_connection_points is not None:
-            connection_points = plain_connection_points
-            plain_joined_shape_count += 1
-        else:
-            connection_points = _parse_shape_points(connection_element.attrib.get("shape", ""))
-        if len(connection_points) >= 2:
-            before_gap = max(
-                distance_2d(connection_points[0], from_points[-1]),
-                distance_2d(connection_points[-1], to_points[0]),
-            )
-            max_endpoint_gap_before = max(max_endpoint_gap_before, before_gap)
-        aligned_shape = (
-            _joined_intersection_connection_shape(connection_points, from_points, to_points)
-            if is_joined_intersection_connection
-            else None
-        )
-        if aligned_shape is None:
-            aligned_shape = _aligned_internal_connection_shape(connection_points, from_points, to_points)
-            if is_joined_intersection_connection:
-                fallback_joined_count += 1
-        if aligned_shape is None:
-            unrepaired_count += 1
-            if len(examples) < MAX_INTERNAL_CONNECTION_ALIGN_EXAMPLES:
-                examples.append(
-                    {
-                        "from": from_edge_id,
-                        "to": to_edge_id,
-                        "fromLane": from_lane_index,
-                        "toLane": to_lane_index,
-                        "reason": "unshapeable",
-                    }
-                )
-            continue
+        reference = plain.get(keys[index], ())
+        shapes = _source_aligned_internal_shapes([original[via] for via in chain], reference)
+        corrections = {via: shape for via, shape in zip(chain, shapes) if shape != original[via]}
+        if corrections:
+            reflected.update(corrections)
+            for connection in [owners[index], *links]:
+                shape = _parse_shape_points(connection.get("shape", ""))
+                corrected = _source_aligned_internal_shapes([shape], reference)[0]
+                if corrected != shape:
+                    connection.set("shape", _shape_string(corrected))
+    internal_shapes = {**original, **reflected}
+    from_ids = [_net_lane_id(key[0], key[2]) for key in keys]
+    to_ids = [_net_lane_id(key[1], key[3]) for key in keys]
+    groups: dict[str, list[int]] = defaultdict(list)
+    for index, lane_id in enumerate(to_ids):
+        groups[lane_id].append(index)
+    failures: dict[int, str] = {}
+    frozen: set[str] = set()
+    proposals: dict[int, tuple[tuple[Point3D, ...], list[tuple[Point3D, ...]]]] = {}
+    prefixes: dict[str, tuple[Point3D, ...]] = {}
 
-        replacement_points, source = aligned_shape
-        replacement_shape = _shape_string(replacement_points)
-        replacement_length = f"{polyline_length(replacement_points):.3f}"
-        after_gap = max(
-            distance_2d(replacement_points[0], from_points[-1]),
-            distance_2d(replacement_points[-1], to_points[0]),
-        )
-        max_endpoint_gap_after = max(max_endpoint_gap_after, after_gap)
-        if is_joined_intersection_connection:
-            max_joined_endpoint_gap_after = max(max_joined_endpoint_gap_after, after_gap)
-        if source == "joined_preserved":
-            preserved_joined_count += 1
-        shape_changed = connection_element.attrib.get("shape") != replacement_shape
-        length_changed = connection_element.attrib.get("length") != replacement_length
-        via_lane_element = lanes_by_id.get(via_lane_id) if via_lane_id else None
-        via_changed = (
-            via_lane_element is not None
-            and (
-                via_lane_element.attrib.get("shape") != replacement_shape
-                or via_lane_element.attrib.get("length") != replacement_length
-            )
-        )
-        if not shape_changed and not length_changed and not via_changed:
-            continue
-
-        connection_element.set("shape", replacement_shape)
-        connection_element.set("length", replacement_length)
-        if via_lane_element is not None:
-            via_lane_element.set("shape", replacement_shape)
-            via_lane_element.set("length", replacement_length)
-        aligned_count += 1
-        if source == "trimmed":
-            trimmed_count += 1
-        elif source == "direct_fallback":
-            direct_fallback_count += 1
-        elif source == "tangent_fallback":
-            tangent_fallback_count += 1
-        if len(examples) < MAX_INTERNAL_CONNECTION_ALIGN_EXAMPLES:
-            examples.append(
-                {
-                    "from": from_edge_id,
-                    "to": to_edge_id,
-                    "fromLane": from_lane_index,
-                    "toLane": to_lane_index,
-                    "via": via_lane_id,
-                    "source": source,
-                    "length_m": round(polyline_length(replacement_points), 6),
-                }
-            )
-
-    if aligned_count:
-        ET.indent(tree, space="    ")
-        tree.write(path, encoding="utf-8", xml_declaration=True)
-
-    return {
-        "scanned_connection_count": scanned_count,
-        "aligned_connection_count": aligned_count,
-        "trimmed_connection_shape_count": trimmed_count,
-        "direct_fallback_shape_count": direct_fallback_count,
-        "tangent_fallback_shape_count": tangent_fallback_count,
-        "preserved_joined_internal_lane_count": preserved_joined_count,
-        "fallback_joined_internal_lane_count": fallback_joined_count,
-        "plain_joined_connection_shape_count": plain_joined_shape_count,
-        "unrepaired_connection_count": unrepaired_count,
-        "max_endpoint_gap_before_m": round(max_endpoint_gap_before, 6),
-        "max_endpoint_gap_after_m": round(max_endpoint_gap_after, 6),
-        "max_joined_internal_endpoint_gap_after_m": round(max_joined_endpoint_gap_after, 6),
-        "examples": examples,
-    }
-
-def _repair_degenerate_internal_lane_shapes(net_path: str | Path) -> dict[str, object]:
-    path = Path(net_path)
-    tree = ET.parse(path)
-    root = tree.getroot()
-    lanes_by_id: dict[str, ET.Element] = {}
-    lane_shapes: dict[str, tuple[Point3D, ...]] = {}
-    internal_lane_ids: set[str] = set()
-
-    for edge_element in root.findall("edge"):
-        is_internal = _is_internal_edge(edge_element)
-        for lane_element in edge_element.findall("lane"):
-            lane_id = lane_element.attrib.get("id")
-            shape = lane_element.attrib.get("shape")
-            if lane_id is None or shape is None:
+    while True:
+        normal = {key: original[key] if key in frozen else points for key, points in source.items()}
+        prefixes = {}
+        problems: dict[int, str] = {}
+        for target, indices in groups.items():
+            if any(index in failures for index in indices):
                 continue
-            lanes_by_id[lane_id] = lane_element
-            lane_shapes[lane_id] = _parse_shape_points(shape)
-            if is_internal:
-                internal_lane_ids.add(lane_id)
-
-    connection_by_via: dict[str, ET.Element] = {}
-    for connection_element in root.findall("connection"):
-        via_lane_id = connection_element.attrib.get("via")
-        if via_lane_id:
-            connection_by_via[via_lane_id] = connection_element
-
-    degenerate_ids: list[str] = []
-    repaired_ids: list[str] = []
-    unrepaired_ids: list[str] = []
-    examples: list[dict[str, object]] = []
-
-    for lane_id in sorted(internal_lane_ids, key=_sort_key):
-        points = lane_shapes.get(lane_id, tuple())
-        if _polyline_length_2d(points) >= DEGENERATE_INTERNAL_LANE_XY_LENGTH_M:
-            continue
-        degenerate_ids.append(lane_id)
-        connection = connection_by_via.get(lane_id)
-        if connection is None:
-            unrepaired_ids.append(lane_id)
-            if len(examples) < 20:
-                examples.append({"lane_id": lane_id, "reason": "missing_via_connection"})
-            continue
-        from_edge = connection.attrib.get("from")
-        to_edge = connection.attrib.get("to")
-        from_lane = connection.attrib.get("fromLane")
-        to_lane = connection.attrib.get("toLane")
-        if from_edge is None or to_edge is None or from_lane is None or to_lane is None:
-            unrepaired_ids.append(lane_id)
-            if len(examples) < 20:
-                examples.append({"lane_id": lane_id, "reason": "incomplete_connection"})
-            continue
-        from_points = lane_shapes.get(_net_lane_id(from_edge, from_lane), tuple())
-        to_points = lane_shapes.get(_net_lane_id(to_edge, to_lane), tuple())
-        replacement_shape = _replacement_internal_shape(from_points, to_points)
-        if replacement_shape is None:
-            unrepaired_ids.append(lane_id)
-            if len(examples) < 20:
-                examples.append({"lane_id": lane_id, "reason": "missing_or_degenerate_neighbor_shapes"})
-            continue
-        lane_element = lanes_by_id[lane_id]
-        lane_element.set("shape", _shape_string(replacement_shape))
-        lane_shapes[lane_id] = replacement_shape
-        repaired_ids.append(lane_id)
-        if len(examples) < 20:
-            examples.append(
-                {
-                    "lane_id": lane_id,
-                    "from": from_edge,
-                    "fromLane": from_lane,
-                    "to": to_edge,
-                    "toLane": to_lane,
-                    "repaired_xy_length_m": round(_polyline_length_2d(replacement_shape), 6),
-                }
+            points = normal.get(target, ())
+            needs_stub = any(
+                normal.get(from_ids[i]) and points
+                and distance_2d(normal[from_ids[i]][-1], points[0]) < 0.01
+                and not (plain.get(keys[i]) and distance_2d(plain[keys[i]][-1], points[0]) <= 0.001)
+                for i in indices
             )
+            if not needs_stub:
+                continue
+            split = _split_shape_at(points, REPAIRED_INTERNAL_LANE_FALLBACK_LENGTH_M)
+            if split is None or distance_2d(split[1][0], split[1][1]) < 0.05:
+                problems[indices[0]] = "successor_too_short_for_stub"
+                continue
+            if abs(split[0][-1].z - points[0].z) > 0.05:
+                problems[indices[0]] = "stub_height_change_exceeds_limit"
+                continue
+            prefixes[target], normal[target] = split
 
-    if repaired_ids:
-        ET.indent(tree, space="    ")
-        tree.write(path, encoding="utf-8", xml_declaration=True)
+        proposals = {}
+        via_proposals: dict[str, tuple[Point3D, ...]] = {}
+        for index, owner in enumerate(owners):
+            if index in failures or index in problems:
+                continue
+            chain, _ = chains[index]
+            incoming, successor = normal.get(from_ids[index], ()), normal.get(to_ids[index], ())
+            if not chain or any(lane_id not in original for lane_id in chain):
+                problems[index] = "non_unique_or_missing_via_chain"
+                continue
+            if len(incoming) < 2 or len(successor) < 2:
+                problems[index] = "missing_normal_lane_shape"
+                continue
+            start, end = incoming[-1], successor[0]
+            curve = plain.get(keys[index], _parse_shape_points(owner.get("shape", "")))
+            source_end = source.get(to_ids[index], successor)[0]
+            # Tangent fallback shapes extend into the next lane; they are not
+            # source intersection curves and must not be copied over that lane.
+            if curve and distance_2d(curve[-1], source_end) <= 0.001:
+                # An unchanged adjoining lane may already be cut by netconvert.
+                # Include the omitted source interval, then clip the whole curve.
+                for lane_id, endpoint, at_start in ((from_ids[index], start, True), (to_ids[index], end, False)):
+                    reference = source.get(lane_id, ())
+                    projection = _project_point_on_polyline(reference, endpoint)
+                    if projection and projection[0] <= 0.001:
+                        if at_start:
+                            segment = _slice_polyline_between(
+                                reference, projection[1], endpoint, _polyline_length_2d(reference), reference[-1],
+                            )
+                        else:
+                            segment = _slice_polyline_between(reference, 0.0, reference[0], projection[1], endpoint)
+                        if segment:
+                            curve = (*segment, *curve) if at_start else (*curve, *segment)
+            else:
+                curve = (start, *prefixes.get(to_ids[index], ()), end)
+            first = _project_point_on_polyline(curve, start)
+            last = _project_point_on_polyline(curve, end)
+            points = None
+            if first and last and first[0] <= 0.001 and last[0] <= 0.001:
+                points = _slice_polyline_between(curve, first[1], start, last[1], end)
+            if points is None:
+                problems[index] = "source_curve_endpoint_mismatch"
+                continue
+            points = _parse_shape_points(_shape_string(points))
+            entry, exit_segment = _last_nonzero_segment(incoming), _first_nonzero_segment(successor)
+            if entry is None or exit_segment is None:
+                problems[index] = "degenerate_normal_lane_shape"
+                continue
+            if _max_shape_turn((*entry, *points, *exit_segment)) > 45.0 + 1e-6:
+                problems[index] = "heading_change_exceeds_limit"
+                continue
+            split_shapes = [internal_shapes[lane_id] for lane_id in chain]
+            cuts = [(0.0, points[0])]
+            for before, after in zip(split_shapes, split_shapes[1:]):
+                if not before or not after:
+                    break
+                boundary = _interpolate_point(before[-1], after[0], 0.5)
+                projection = _project_point_on_polyline(points, boundary)
+                if projection is None or projection[1] <= cuts[-1][0] + 0.01:
+                    break
+                cuts.append((projection[1], projection[2]))
+            cuts.append((_polyline_length_2d(points), points[-1]))
+            pieces = [_slice_polyline_between(points, a, p, b, q) for (a, p), (b, q) in zip(cuts, cuts[1:])]
+            if len(pieces) != len(chain) or any(piece is None for piece in pieces):
+                problems[index] = "ambiguous_internal_split"
+                continue
+            pieces = [_parse_shape_points(_shape_string(piece)) for piece in pieces]
+            if _polyline_length_2d(points) <= 0.251:
+                lengths = [distance_2d(*entry), distance_2d(*exit_segment)]
+                lengths += [distance_2d(a, b) for piece in pieces for a, b in zip(piece, piece[1:])]
+                if min(lengths) < 0.05 - 1e-9:
+                    problems[index] = "stub_segment_too_short"
+                    continue
+                boundaries = [(from_ids[index], incoming, (-1,)), (to_ids[index], successor, (0,))]
+                boundaries += [(via, piece, (0, -1)) for via, piece in zip(chain, pieces)]
+                if any(not original[lane_id] or any(abs(shape[pos].z - original[lane_id][pos].z) > 0.05
+                       for pos in positions) for lane_id, shape, positions in boundaries):
+                    problems[index] = "stub_height_change_exceeds_limit"
+                    continue
+            if any(lane_id in via_proposals and via_proposals[lane_id] != piece for lane_id, piece in zip(chain, pieces)):
+                problems[index] = "shared_via_shape_conflict"
+                continue
+            via_proposals.update(zip(chain, pieces))
+            proposals[index] = (points, pieces)
+        if not problems:
+            break
+        while problems:
+            index, reason = problems.popitem()
+            if index in failures:
+                continue
+            failures[index] = reason
+            frozen.update((from_ids[index], to_ids[index]))
+            for other in groups[to_ids[index]]:
+                if other not in failures:
+                    problems.setdefault(other, "ambiguous_successor_group")
+            for via in chains[index][0] or [owners[index].get("via")]:
+                for other in owners_by_via[via]:
+                    if other not in failures:
+                        problems.setdefault(other, "shared_ambiguous_via")
+        # Each pass excludes at least one additional movement, so this converges.
 
+    replacements = {**reflected, **normal}
+    for index, (points, pieces) in proposals.items():
+        owner = owners[index]
+        owner.set("shape", _shape_string(points))
+        chain, links = chains[index]
+        replacements.update(zip(chain, pieces))
+        # Continuation connections own only the remaining via chain, never the
+        # complete external-to-external movement. A direct exit has no shape.
+        for offset, link in enumerate(links):
+            if offset + 1 == len(pieces):
+                link.attrib.pop("shape", None)
+                link.attrib.pop("length", None)
+            else:
+                tail = tuple(point for piece in pieces[offset + 1:] for point in piece)
+                link.set("shape", _shape_string(tail))
+                link.set("length", f"{sum(max(polyline_length(piece), MIN_SUMO_LANE_LENGTH_M) for piece in pieces[offset + 1:]):.3f}")
+        owner.set("length", f"{sum(max(polyline_length(piece), MIN_SUMO_LANE_LENGTH_M) for piece in pieces):.3f}")
+    changed = {key for key, points in replacements.items() if original[key] != points}
+    for key in changed:
+        lanes[key].set("shape", _shape_string(replacements[key]))
+    ET.indent(tree, space="    ")
+    tree.write(path, encoding="utf-8", xml_declaration=True)
+    unresolved = [
+        dict(zip(("from", "to", "fromLane", "toLane"), keys[i]), via=owners[i].get("via"), reason=reason)
+        for i, reason in sorted(failures.items())
+    ]
+    repaired_degenerate = sum(key not in normal_ids and _polyline_length_2d(original[key]) < 0.01 for key in changed)
     return {
-        "scanned_internal_lane_count": len(internal_lane_ids),
-        "degenerate_internal_lane_count": len(degenerate_ids),
-        "repaired_internal_lane_count": len(repaired_ids),
-        "unrepaired_internal_lane_count": len(unrepaired_ids),
-        "examples": examples,
+        "scanned_connection_count": len(owners),
+        "aligned_connection_count": len(proposals),
+        "restored_normal_lane_count": len(changed & normal_ids),
+        "repaired_internal_lane_count": len(changed - normal_ids),
+        "repaired_degenerate_internal_lane_count": repaired_degenerate,
+        "allocated_successor_stub_count": len(prefixes),
+        "split_connection_count": sum(len(chains[i][0]) > 1 for i in proposals),
+        "corrected_y_reflection_lane_count": len(reflected),
+        "unrepaired_connection_count": len(failures),
+        "unrepaired_connections": unresolved,
+        "reason_counts": dict(Counter(failures.values())),
+        "max_endpoint_gap_after_m": max(
+            (max(distance_2d(points[0], normal[from_ids[i]][-1]), distance_2d(points[-1], normal[to_ids[i]][0]))
+             for i, (points, _) in proposals.items()), default=0.0,
+        ),
     }
+
 
 def _patch_net_lane_lengths_to_shape(net_path: str | Path) -> dict[str, object]:
     path = Path(net_path)
